@@ -13,7 +13,7 @@ The original project ran small models (0.6B–0.8B). We've added **chunked FFN c
 - ~8s cached init (216 ANE kernels + 10 LM head chunks)
 - First run compiles in ~28s, subsequent runs load from persistent ANE cache
 
-Also includes **dynamic-weight matrix-vector multiply** APIs — the building blocks for weight-swapping without recompilation. See our [Apple Neural Engine field guide](https://github.com/skyfallsin/apple-neural-engine) for the full reverse-engineering findings.
+Also includes **dynamic-weight matrix-vector multiply** APIs — the building blocks for weight-swapping without recompilation. See our [Apple Neural Engine field guide](https://github.com/skyfallsin/apple-neural-engine-field-guide) for the full reverse-engineering findings.
 
 ## Supported Models
 
@@ -92,7 +92,7 @@ Through systematic reverse-engineering (25+ targeted test programs), we've docum
 - **Dynamic matvec works via CPU-side tiling** — same-shape `mul` + `reduce_sum` at 1.65ms for 2560×2560 (5× slower than const-weight conv, but zero recompile on weight swap)
 - **Dispatch overhead dominates** — 99.9% of per-token time is CPU↔ANE round-trips, not compute. Fusing ops matters more than quantization.
 
-**📖 Full details: [Apple Neural Engine — Reverse-Engineering Field Guide](https://github.com/skyfallsin/apple-neural-engine)**
+**📖 Full details: [Apple Neural Engine — Reverse-Engineering Field Guide](https://github.com/skyfallsin/apple-neural-engine-field-guide)**
 
 ## Requirements
 
