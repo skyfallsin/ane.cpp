@@ -494,30 +494,140 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
     return true;
 }
 
+// Forward pass profiling accumulators (print with PROFILE_FORWARD=1 env var)
+static struct FwdProfile {
+    double rmsnorm_ms = 0, qkv_ms = 0, qk_norm_ms = 0, rope_ms = 0;
+    double attention_ms = 0, o_proj_ms = 0, residual_ms = 0, ffn_ms = 0;
+    double lm_head_ms = 0, total_ms = 0;
+    int count = 0;
+    bool enabled = false;
+    bool checked = false;
+
+    void check() {
+        if (!checked) {
+            checked = true;
+            enabled = getenv("PROFILE_FORWARD") != nullptr;
+        }
+    }
+
+    void print() {
+        if (!enabled || count == 0) return;
+        double n = (double)count;
+        fprintf(stderr, "\n=== Forward pass profile (%d tokens, avg per token) ===\n", count);
+        fprintf(stderr, "  rmsnorm:   %6.2f ms  (%.1f%%)\n", rmsnorm_ms/n, 100*rmsnorm_ms/total_ms);
+        fprintf(stderr, "  qkv_proj:  %6.2f ms  (%.1f%%)\n", qkv_ms/n, 100*qkv_ms/total_ms);
+        fprintf(stderr, "  qk_norm:   %6.2f ms  (%.1f%%)\n", qk_norm_ms/n, 100*qk_norm_ms/total_ms);
+        fprintf(stderr, "  rope:      %6.2f ms  (%.1f%%)\n", rope_ms/n, 100*rope_ms/total_ms);
+        fprintf(stderr, "  attention: %6.2f ms  (%.1f%%)\n", attention_ms/n, 100*attention_ms/total_ms);
+        fprintf(stderr, "  o_proj:    %6.2f ms  (%.1f%%)\n", o_proj_ms/n, 100*o_proj_ms/total_ms);
+        fprintf(stderr, "  residual:  %6.2f ms  (%.1f%%)\n", residual_ms/n, 100*residual_ms/total_ms);
+        fprintf(stderr, "  ffn:       %6.2f ms  (%.1f%%)\n", ffn_ms/n, 100*ffn_ms/total_ms);
+        fprintf(stderr, "  lm_head:   %6.2f ms  (%.1f%%)\n", lm_head_ms/n, 100*lm_head_ms/total_ms);
+        fprintf(stderr, "  TOTAL:     %6.2f ms  (sum of above)\n", total_ms/n);
+        fprintf(stderr, "==============================================\n");
+    }
+
+    ~FwdProfile() { print(); }
+} g_fwd_prof;
+
 float* Qwen3Model::forward(int token_id, int pos) {
+    g_fwd_prof.check();
+    Timer t_total;
+
     memcpy(x_, embed_tokens_ + (int64_t)token_id * hidden_size_, hidden_size_ * sizeof(float));
 
     float* pre_oproj = scratch_attn_;
 
     for (int L = 0; L < num_layers_; L++) {
+        Timer t;
         rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
+        if (g_fwd_prof.enabled) g_fwd_prof.rmsnorm_ms += t.elapsed_ms();
 
-        if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) {
+        // QKV projection (ANE)
+        if (g_fwd_prof.enabled) t.reset();
+        float* qkv_buf = scratch_qkv_;
+        if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x_norm_,
+                        hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
+            fprintf(stderr, "ANE first_proj eval failed at layer %d\n", L);
             return nullptr;
         }
+        if (g_fwd_prof.enabled) g_fwd_prof.qkv_ms += t.elapsed_ms();
 
+        float* q_raw = qkv_buf;
+        float* k_raw = qkv_buf + q_proj_dim_;
+        float* v_raw = qkv_buf + q_proj_dim_ + kv_proj_dim_;
+
+        // QK norm
+        if (g_fwd_prof.enabled) t.reset();
+        for (int h = 0; h < num_q_heads_; h++) {
+            float* qh = q_raw + (size_t)h * head_dim_;
+            rmsnorm(qh, qh, layers_[L].q_norm, head_dim_, rms_eps_);
+        }
+        for (int h = 0; h < num_kv_heads_; h++) {
+            float* kh = k_raw + (size_t)h * head_dim_;
+            rmsnorm(kh, kh, layers_[L].k_norm, head_dim_, rms_eps_);
+        }
+        if (g_fwd_prof.enabled) g_fwd_prof.qk_norm_ms += t.elapsed_ms();
+
+        // RoPE
+        if (g_fwd_prof.enabled) t.reset();
+        const float* rope_cos_row = nullptr;
+        const float* rope_sin_row = nullptr;
+        if (pos >= 0 && pos < rope_cache_len_ && rope_cos_ && rope_sin_) {
+            int half_rot = rot_dim_ / 2;
+            rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+            rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+        }
+        apply_rope_qwen3(q_raw, k_raw, num_q_heads_, num_kv_heads_,
+                         head_dim_, pos, rope_theta_, rope_cos_row, rope_sin_row);
+        if (g_fwd_prof.enabled) g_fwd_prof.rope_ms += t.elapsed_ms();
+
+        // KV cache + attention
+        if (g_fwd_prof.enabled) t.reset();
+        {
+            auto& cache = kv_caches_[L];
+            int slot;
+            if (cache.len < cache.capacity) {
+                slot = cache.start + cache.len;
+                if (slot >= cache.capacity) slot -= cache.capacity;
+                cache.len++;
+            } else {
+                slot = cache.start;
+                cache.start++;
+                if (cache.start >= cache.capacity) cache.start = 0;
+            }
+            size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
+            memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+            memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+            gqa_attention(pre_oproj, q_raw, cache.k_cache, cache.v_cache,
+                          num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
+                          cache.start, cache.len, cache.capacity);
+        }
+        if (g_fwd_prof.enabled) g_fwd_prof.attention_ms += t.elapsed_ms();
+
+        // O projection (ANE)
+        if (g_fwd_prof.enabled) t.reset();
         float* attn_out = x_norm_;
         if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, full_out_dim_, hidden_size_)) {
             fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
             return nullptr;
         }
+        if (g_fwd_prof.enabled) g_fwd_prof.o_proj_ms += t.elapsed_ms();
 
+        // Residual + post-attn norm
+        if (g_fwd_prof.enabled) t.reset();
         for (int i = 0; i < hidden_size_; i++) {
             x_[i] += attn_out[i];
         }
-
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+        if (g_fwd_prof.enabled) {
+            g_fwd_prof.residual_ms += t.elapsed_ms();
+            g_fwd_prof.rmsnorm_ms += t.elapsed_ms() * 0.5; // rough split
+            g_fwd_prof.residual_ms -= t.elapsed_ms() * 0.5;
+        }
 
+        // FFN (ANE)
+        if (g_fwd_prof.enabled) t.reset();
         float* mlp_out = scratch_attn_;
         if (ane_layers_[L].fused_ffn) {
             if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
@@ -533,33 +643,52 @@ float* Qwen3Model::forward(int token_id, int pos) {
             fprintf(stderr, "No FFN kernel for layer %d\n", L);
             return nullptr;
         }
+        if (g_fwd_prof.enabled) g_fwd_prof.ffn_ms += t.elapsed_ms();
 
+        // Residual add
+        if (g_fwd_prof.enabled) t.reset();
         for (int i = 0; i < hidden_size_; i++) {
             x_[i] += mlp_out[i];
         }
+        if (g_fwd_prof.enabled) g_fwd_prof.residual_ms += t.elapsed_ms();
     }
 
-    rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
+    // Final norm
+    {
+        Timer t;
+        rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
+        if (g_fwd_prof.enabled) g_fwd_prof.rmsnorm_ms += t.elapsed_ms();
+    }
 
-    if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
-        bool ok = true;
-        int chunks = (int)lm_head_kernels_.size();
-        for (int c = 0; c < chunks; c++) {
-            int offset = c * lm_head_chunk_;
-            int rows = vocab_size_ - offset;
-            if (rows > lm_head_chunk_) rows = lm_head_chunk_;
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
-                fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
-                ok = false;
-                break;
+    // LM head
+    {
+        Timer t;
+        if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
+            bool ok = true;
+            int chunks = (int)lm_head_kernels_.size();
+            for (int c = 0; c < chunks; c++) {
+                int offset = c * lm_head_chunk_;
+                int rows = vocab_size_ - offset;
+                if (rows > lm_head_chunk_) rows = lm_head_chunk_;
+                if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
+                    fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
+                    ok = false;
+                    break;
+                }
             }
-        }
-        if (!ok) {
-            free_lm_head_ane();
+            if (!ok) {
+                free_lm_head_ane();
+                matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+            }
+        } else {
             matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
         }
-    } else {
-        matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+        if (g_fwd_prof.enabled) g_fwd_prof.lm_head_ms += t.elapsed_ms();
+    }
+
+    if (g_fwd_prof.enabled) {
+        g_fwd_prof.total_ms += t_total.elapsed_ms();
+        g_fwd_prof.count++;
     }
 
     return logits_;
