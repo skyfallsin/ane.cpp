@@ -469,7 +469,7 @@ static id mil_gen_ffn_chunk_accum(int dim, int chunk_inter) {
 // LM head matmul kernels compile fine at ~34MB (16384*1024*2). Fused FFN
 // with 3 weight matrices works at ~22MB total (0.8B). Conservative limit
 // per chunk: 48MB (single kernels can be larger than fused multi-weight ones).
-static constexpr size_t ANE_FFN_CHUNK_MAX_BYTES = 72 * 1024 * 1024;
+static constexpr size_t ANE_FFN_CHUNK_MAX_BYTES = 150 * 1024 * 1024;
 
 int ane_ffn_chunk_count(int dim, int inter_ch) {
     size_t total = (size_t)3 * inter_ch * dim * 2; // 3 matrices, fp16
