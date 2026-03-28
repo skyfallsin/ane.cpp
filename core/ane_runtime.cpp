@@ -767,8 +767,9 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->fused_ffn);
     ane_free(lk->fused_oproj_norm);
     ane_free(lk->fused_oproj_ffn);
+    ane_free(lk->oproj_add);
     ane_free_chunked_ffn(&lk->chunked_ffn);
-    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = lk->fused_oproj_ffn = nullptr;
+    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = lk->fused_oproj_ffn = lk->oproj_add = nullptr;
 }
 
 // ============ High-level compile functions ============
@@ -1029,6 +1030,95 @@ bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
     int in_chs[2] = { in_dim, out_dim };
     float* outs[2] = { x_norm, x_updated };
     int out_chs[2] = { out_dim, out_dim };
+    return ane_eval_multi(k, ins, in_chs, outs, out_chs);
+}
+
+// ============ Simplified O_proj + residual add (no RMSNorm) ============
+// Just conv + add — the RMSNorm chain was redundant (CPU redoes it for precision)
+
+static id mil_gen_oproj_add(int out_dim, int in_dim) {
+    std::string s;
+    char buf[512];
+    s += MIL_HEADER;
+    snprintf(buf, sizeof(buf),
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> attn,"
+        " tensor<fp16, [1, %d, 1, %d]> xres) {\n", in_dim, SP, out_dim, SP);
+    s += buf;
+
+    // Conv params
+    s += "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+         "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+         "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n";
+
+    // O_proj conv
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wo = const()[name = tensor<string, []>(\"Wo\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/oproj.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        out_dim, in_dim, out_dim, in_dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> oproj = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wo, x = attn)"
+        "[name = tensor<string, []>(\"op\")];\n", out_dim, SP);
+    s += buf;
+
+    // Residual add — single output
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> y = add(x = xres, y = oproj)"
+        "[name = tensor<string, []>(\"ad\")];\n", out_dim, SP);
+    s += buf;
+
+    s += "    } -> (y);\n}\n";
+    return ns_data(s.c_str(), s.size());
+}
+
+ANEKernel* ane_compile_oproj_add(const uint16_t* oproj_bf16, int out_dim, int in_dim) {
+    void* pool = objc_autoreleasePoolPush();
+    id w_oproj = build_weight_blob(oproj_bf16, out_dim * in_dim);
+    id keys[] = { ns_str("@model_path/weights/oproj.bin") };
+    id values[] = { ns_weight_entry(w_oproj) };
+    id wdict = ns_dict(keys, values, 1);
+
+    id mil = mil_gen_oproj_add(out_dim, in_dim);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    size_t out_size = (size_t)out_dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+ANEKernel* ane_compile_oproj_add_blob(const std::string& oproj_path, int out_dim, int in_dim) {
+    void* pool = objc_autoreleasePoolPush();
+    id w_oproj = load_blob_file(oproj_path);
+    if (!w_oproj) { objc_autoreleasePoolPop(pool); return nullptr; }
+    id keys[] = { ns_str("@model_path/weights/oproj.bin") };
+    id values[] = { ns_weight_entry(w_oproj) };
+    id wdict = ns_dict(keys, values, 1);
+
+    id mil = mil_gen_oproj_add(out_dim, in_dim);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    size_t out_size = (size_t)out_dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+bool ane_eval_oproj_add(ANEKernel* k, float* x_updated,
+                         const float* attn_out, const float* x_residual,
+                         int in_dim, int out_dim) {
+    float* ins[2] = { (float*)attn_out, (float*)x_residual };
+    int in_chs[2] = { in_dim, out_dim };
+    float* outs[1] = { x_updated };
+    int out_chs[1] = { out_dim };
     return ane_eval_multi(k, ins, in_chs, outs, out_chs);
 }
 

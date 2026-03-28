@@ -328,16 +328,14 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
         if (use_blobs) {
-            ane_layers_[L].fused_oproj_norm = ane_compile_fused_oproj_norm_blob(
-                blob_path(blob_dir, name), layers_[L].post_attention_layernorm,
-                hidden_size_, full_out_dim_, rms_eps_);
+            ane_layers_[L].oproj_add = ane_compile_oproj_add_blob(
+                blob_path(blob_dir, name), hidden_size_, full_out_dim_);
         } else {
-            ane_layers_[L].fused_oproj_norm = ane_compile_fused_oproj_norm(
-                sf->get_bf16_ptr(name), layers_[L].post_attention_layernorm,
-                hidden_size_, full_out_dim_, rms_eps_);
+            ane_layers_[L].oproj_add = ane_compile_oproj_add(
+                sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
         }
-        if (!ane_layers_[L].fused_oproj_norm) {
-            fprintf(stderr, "ANE fused_oproj_norm compile failed for layer %d, falling back to o_proj\n", L);
+        if (!ane_layers_[L].oproj_add) {
+            fprintf(stderr, "ANE oproj_add compile failed for layer %d, falling back to o_proj\n", L);
             // Fallback to separate O_proj
             if (use_blobs) {
                 ane_layers_[L].o_proj = ane_compile_matmul_blob(blob_path(blob_dir, name), hidden_size_, full_out_dim_);
@@ -620,10 +618,17 @@ float* Qwen3Model::forward(int token_id, int pos) {
 
         // O projection + residual + norm
         if (g_fwd_prof.enabled) t.reset();
-        if (ane_layers_[L].fused_oproj_norm) {
-            // Fused ANE: conv(O_proj, attn) → add(x_residual) → outputs x_updated
-            // RMSNorm stays on CPU for fp32 precision (fp16 ANE norm drifts over 36 layers)
-            float* tmp_norm = x_norm_; // discard the ANE norm output
+        if (ane_layers_[L].oproj_add) {
+            // Simplified ANE: conv(O_proj, attn) + x_residual → single output x_updated
+            if (!ane_eval_oproj_add(ane_layers_[L].oproj_add,
+                    x_, pre_oproj, x_, full_out_dim_, hidden_size_)) {
+                fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
+                return nullptr;
+            }
+            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+        } else if (ane_layers_[L].fused_oproj_norm) {
+            // Legacy fused: conv + add + RMSNorm (norm output discarded)
+            float* tmp_norm = x_norm_;
             ane_eval_fused_oproj_norm(ane_layers_[L].fused_oproj_norm,
                 tmp_norm, x_, pre_oproj, x_, full_out_dim_, hidden_size_);
             rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);

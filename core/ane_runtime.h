@@ -28,6 +28,7 @@ struct LayerANEKernels {
     ChunkedFFN chunked_ffn = {};
     ANEKernel* fused_oproj_norm = nullptr;  // conv(O_proj) → add(res) → RMSNorm [2 outputs: x_norm, x_updated]
     ANEKernel* fused_oproj_ffn = nullptr;   // conv(O_proj) → add(res) → RMSNorm → SwiGLU FFN [2 outputs: ffn_out, x_updated]
+    ANEKernel* oproj_add = nullptr;         // conv(O_proj) → add(res) [1 output: x_updated] — no redundant norm
 };
 
 // Global state
@@ -81,6 +82,15 @@ ANEKernel* ane_compile_fused_oproj_norm_blob(const std::string& oproj_path,
 bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
                                 const float* attn_out, const float* x_residual,
                                 int in_dim, int out_dim);
+
+// Simplified O_proj + residual add (no RMSNorm — CPU handles norm)
+// 2 inputs: attn_out [in_dim], x_residual [out_dim]
+// 1 output: x_updated [out_dim] = x_residual + conv(O_proj, attn_out)
+ANEKernel* ane_compile_oproj_add(const uint16_t* oproj_bf16, int out_dim, int in_dim);
+ANEKernel* ane_compile_oproj_add_blob(const std::string& oproj_path, int out_dim, int in_dim);
+bool ane_eval_oproj_add(ANEKernel* k, float* x_updated,
+                         const float* attn_out, const float* x_residual,
+                         int in_dim, int out_dim);
 
 // Fused O_proj + residual add + RMSNorm + SwiGLU FFN kernel
 // 2 inputs: attn_out [in_dim], x_residual [out_dim]
