@@ -2001,11 +2001,11 @@ bool ane_eval_multi(ANEKernel* k,
     if (!k) return false;
     
     // Write all inputs (SP-strided fp16)
-    // Skip memset — padding positions were zeroed at surface creation and only
-    // the active channel slots (stride=SP) are written, leaving padding as zeros.
     for (int i = 0; i < k->nInputs; i++) {
         IOSurfaceRef surf = k->ioInputs[i];
-        if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+        if (!g_skip_locks) {
+            if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+        }
 #if ANE_USE_NATIVE_FP16
         ane_fp16_t* base = (ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
         int ch = input_channels[i];
@@ -2018,7 +2018,7 @@ bool ane_eval_multi(ANEKernel* k,
         for (int c = 0, idx = 0; c < ch; c++, idx += SP)
             base[idx] = f32_to_f16(inputs[i][c]);
 #endif
-        IOSurfaceUnlock(surf, 0, NULL);
+        if (!g_skip_locks) IOSurfaceUnlock(surf, 0, NULL);
     }
     
     // Eval
@@ -2027,7 +2027,9 @@ bool ane_eval_multi(ANEKernel* k,
     // Read all outputs (SP-strided fp16)
     for (int i = 0; i < k->nOutputs; i++) {
         IOSurfaceRef surf = k->ioOutputs[i];
-        if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+        if (!g_skip_locks) {
+            if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+        }
 #if ANE_USE_NATIVE_FP16
         const ane_fp16_t* base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
 #else
@@ -2041,7 +2043,7 @@ bool ane_eval_multi(ANEKernel* k,
             outputs[i][c] = f16_to_f32(base[(size_t)c * SP]);
 #endif
         }
-        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        if (!g_skip_locks) IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
     }
     return true;
 }
