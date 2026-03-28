@@ -164,41 +164,63 @@ void gqa_attention(float* out, const float* q,
     if (first_span > cache_len) first_span = cache_len;
     int second_span = cache_len - first_span;
 
-    float* scores = (float*)alloca(cache_len * sizeof(float));
+    // Batch all Q heads in a KV group via sgemm: [groups, head_dim] × [cache_len, head_dim]^T
+    // Score buffer: [groups, cache_len] per KV head group
+    float* group_scores = (float*)alloca((size_t)groups * cache_len * sizeof(float));
 
-    for (int h = 0; h < n_heads; h++) {
-        int kv_h = h / groups;
-        const float* qh = q + (size_t)h * q_head_stride;
-        float* oh = out + h * head_dim;
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        int h_start = kv_h * groups;
+        const float* q_group = q + (size_t)h_start * q_head_stride;
+        float* out_group = out + (size_t)h_start * head_dim;
         size_t kv_head_off = (size_t)kv_h * head_dim;
 
-        int t = 0;
-        for (int s = 0; s < first_span; s++, t++) {
-            const float* kh = k_cache + ((size_t)(cache_start + s) * kv_step + kv_head_off);
-            float dot = 0.0f;
-            vDSP_dotpr(qh, 1, kh, 1, &dot, (vDSP_Length)head_dim);
-            scores[t] = dot * scale;
+        // Q·K^T scores via sgemm: [groups, cache_len] = Q[groups, head_dim] × K[cache_len, head_dim]^T
+        if (first_span > 0) {
+            const float* k_span1 = k_cache + (size_t)cache_start * kv_step + kv_head_off;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        groups, first_span, head_dim,
+                        scale,
+                        q_group, q_head_stride,
+                        k_span1, (int)kv_step,
+                        0.0f,
+                        group_scores, cache_len);
         }
-        for (int s = 0; s < second_span; s++, t++) {
-            const float* kh = k_cache + ((size_t)s * kv_step + kv_head_off);
-            float dot = 0.0f;
-            vDSP_dotpr(qh, 1, kh, 1, &dot, (vDSP_Length)head_dim);
-            scores[t] = dot * scale;
+        if (second_span > 0) {
+            const float* k_span2 = k_cache + kv_head_off;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        groups, second_span, head_dim,
+                        scale,
+                        q_group, q_head_stride,
+                        k_span2, (int)kv_step,
+                        0.0f,
+                        group_scores + first_span, cache_len);
         }
 
-        softmax(scores, cache_len);
-
-        memset(oh, 0, head_dim * sizeof(float));
-        t = 0;
-        for (int s = 0; s < first_span; s++, t++) {
-            const float* vh = v_cache + ((size_t)(cache_start + s) * kv_step + kv_head_off);
-            float sv = scores[t];
-            cblas_saxpy(head_dim, sv, vh, 1, oh, 1);
+        // Softmax per Q head (each row of group_scores)
+        for (int g = 0; g < groups; g++) {
+            softmax(group_scores + (size_t)g * cache_len, cache_len);
         }
-        for (int s = 0; s < second_span; s++, t++) {
-            const float* vh = v_cache + ((size_t)s * kv_step + kv_head_off);
-            float sv = scores[t];
-            cblas_saxpy(head_dim, sv, vh, 1, oh, 1);
+
+        // Attention·V via sgemm: out[groups, head_dim] = scores[groups, cache_len] × V[cache_len, head_dim]
+        if (first_span > 0) {
+            const float* v_span1 = v_cache + (size_t)cache_start * kv_step + kv_head_off;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        groups, head_dim, first_span,
+                        1.0f,
+                        group_scores, cache_len,
+                        v_span1, (int)kv_step,
+                        0.0f,
+                        out_group, head_dim);
+        }
+        if (second_span > 0) {
+            const float* v_span2 = v_cache + kv_head_off;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        groups, head_dim, second_span,
+                        1.0f,
+                        group_scores + first_span, cache_len,
+                        v_span2, (int)kv_step,
+                        first_span > 0 ? 1.0f : 0.0f,
+                        out_group, head_dim);
         }
     }
 }
