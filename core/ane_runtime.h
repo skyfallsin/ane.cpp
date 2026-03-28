@@ -30,6 +30,7 @@ struct LayerANEKernels {
     ANEKernel* fused_oproj_ffn = nullptr;   // conv(O_proj) → add(res) → RMSNorm → SwiGLU FFN [2 outputs: ffn_out, x_updated]
     ANEKernel* oproj_add = nullptr;         // conv(O_proj) → add(res) [1 output: x_updated] — no redundant norm
     ANEKernel* ffn_resadd = nullptr;        // SwiGLU FFN + residual add [2 inputs: x_norm, x_res → 1 output: x_res + ffn(x_norm)]
+    ANEKernel* oproj_norm_qkv = nullptr;    // Cross-layer: O_proj_L + add + RMSNorm_{L+1} + QKV_{L+1} [2 out: qkv, x_updated]
 };
 
 // Global state
@@ -102,6 +103,25 @@ ANEKernel* ane_compile_oproj_add_blob(const std::string& oproj_path, int out_dim
 bool ane_eval_oproj_add(ANEKernel* k, float* x_updated,
                          const float* attn_out, const float* x_residual,
                          int in_dim, int out_dim);
+
+// Cross-layer fusion: O_proj_L + residual_add + RMSNorm_{L+1} + QKV_{L+1}
+// 2 inputs: attn_out [in_dim], x_residual [out_dim]
+// 2 outputs: qkv [qkv_dim], x_updated [out_dim]
+ANEKernel* ane_compile_oproj_norm_qkv(const uint16_t* oproj_bf16,
+                                       const float* norm_weight,
+                                       const uint16_t* q_bf16, int q_out,
+                                       const uint16_t* k_bf16, int k_out,
+                                       const uint16_t* v_bf16, int v_out,
+                                       int dim, int in_dim, float eps);
+ANEKernel* ane_compile_oproj_norm_qkv_blob(const std::string& oproj_path,
+                                            const float* norm_weight,
+                                            const std::string& q_path, int q_out,
+                                            const std::string& k_path, int k_out,
+                                            const std::string& v_path, int v_out,
+                                            int dim, int in_dim, float eps);
+bool ane_eval_oproj_norm_qkv(ANEKernel* k, float* qkv, float* x_updated,
+                              const float* attn_out, const float* x_residual,
+                              int in_dim, int dim, int qkv_dim);
 
 // Fused O_proj + residual add + RMSNorm + SwiGLU FFN kernel
 // 2 inputs: attn_out [in_dim], x_residual [out_dim]

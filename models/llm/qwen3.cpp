@@ -300,54 +300,118 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     bool use_blobs = !blob_dir.empty();
     LOG("Compiling Qwen3 ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
 
-    char name[256], name2[256], name3[256];
+    char name[256], name2[256], name3[256], name4[256];
+
+    // --- Cross-layer fusion strategy ---
+    // Layer 0: standalone QKV (first_proj) — no previous layer to fuse with
+    // Layers 0..N-2: oproj_norm_qkv[L] fuses O_proj_L + input_ln_{L+1} + QKV_{L+1}
+    // Layer N-1: standalone oproj_add — no next layer to fuse with
+    // All layers: FFN (unchanged)
+
+    int fused_count = 0;
+    bool compile_cross_layer = getenv("CROSS_LAYER_FUSION") != nullptr;
 
     for (int L = 0; L < num_layers_; L++) {
         LOG("  Layer %d/%d...\r", L + 1, num_layers_);
 
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
-        snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
-        snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
+        // --- QKV projection ---
+        if (L == 0 || !compile_cross_layer) {
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].first_proj = ane_compile_fused_3_blob(
-                blob_path(blob_dir, name), q_proj_dim_,
-                blob_path(blob_dir, name2), kv_proj_dim_,
-                blob_path(blob_dir, name3), kv_proj_dim_, hidden_size_);
-        } else {
-            ane_layers_[L].first_proj = ane_compile_fused_3(
-                sf->get_bf16_ptr(name), q_proj_dim_,
-                sf->get_bf16_ptr(name2), kv_proj_dim_,
-                sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
-        }
-
-        if (!ane_layers_[L].first_proj) {
-            fprintf(stderr, "ANE first_proj compile failed for layer %d\n", L);
-            return false;
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
-        if (use_blobs) {
-            ane_layers_[L].oproj_add = ane_compile_oproj_add_blob(
-                blob_path(blob_dir, name), hidden_size_, full_out_dim_);
-        } else {
-            ane_layers_[L].oproj_add = ane_compile_oproj_add(
-                sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
-        }
-        if (!ane_layers_[L].oproj_add) {
-            fprintf(stderr, "ANE oproj_add compile failed for layer %d, falling back to o_proj\n", L);
-            // Fallback to separate O_proj
             if (use_blobs) {
-                ane_layers_[L].o_proj = ane_compile_matmul_blob(blob_path(blob_dir, name), hidden_size_, full_out_dim_);
+                ane_layers_[L].first_proj = ane_compile_fused_3_blob(
+                    blob_path(blob_dir, name), q_proj_dim_,
+                    blob_path(blob_dir, name2), kv_proj_dim_,
+                    blob_path(blob_dir, name3), kv_proj_dim_, hidden_size_);
             } else {
-                ane_layers_[L].o_proj = ane_compile_matmul(sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
+                ane_layers_[L].first_proj = ane_compile_fused_3(
+                    sf->get_bf16_ptr(name), q_proj_dim_,
+                    sf->get_bf16_ptr(name2), kv_proj_dim_,
+                    sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
             }
-            if (!ane_layers_[L].o_proj) {
-                fprintf(stderr, "ANE o_proj compile failed for layer %d\n", L);
+            if (!ane_layers_[L].first_proj) {
+                fprintf(stderr, "ANE first_proj compile failed for layer %d\n", L);
                 return false;
             }
         }
 
+        // --- O_proj: fused cross-layer or standalone ---
+        if (L < num_layers_ - 1 && compile_cross_layer) {
+            // Try cross-layer fusion: O_proj_L + RMSNorm_{L+1} + QKV_{L+1}
+            int nextL = L + 1;
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+            snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.q_proj.weight", nextL);
+            snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.k_proj.weight", nextL);
+            snprintf(name4, sizeof(name4), "model.layers.%d.self_attn.v_proj.weight", nextL);
+
+            if (use_blobs) {
+                ane_layers_[L].oproj_norm_qkv = ane_compile_oproj_norm_qkv_blob(
+                    blob_path(blob_dir, name),
+                    layers_[nextL].input_layernorm,
+                    blob_path(blob_dir, name2), q_proj_dim_,
+                    blob_path(blob_dir, name3), kv_proj_dim_,
+                    blob_path(blob_dir, name4), kv_proj_dim_,
+                    hidden_size_, full_out_dim_, rms_eps_);
+            } else {
+                ane_layers_[L].oproj_norm_qkv = ane_compile_oproj_norm_qkv(
+                    sf->get_bf16_ptr(name),
+                    layers_[nextL].input_layernorm,
+                    sf->get_bf16_ptr(name2), q_proj_dim_,
+                    sf->get_bf16_ptr(name3), kv_proj_dim_,
+                    sf->get_bf16_ptr(name4), kv_proj_dim_,
+                    hidden_size_, full_out_dim_, rms_eps_);
+            }
+
+            if (ane_layers_[L].oproj_norm_qkv) {
+                fused_count++;
+            } else {
+                fprintf(stderr, "ANE oproj_norm_qkv failed for layer %d, falling back\n", L);
+            }
+
+            // Always compile standalone oproj_add + next-layer QKV as fallback
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+            if (use_blobs) {
+                ane_layers_[L].oproj_add = ane_compile_oproj_add_blob(
+                    blob_path(blob_dir, name), hidden_size_, full_out_dim_);
+            } else {
+                ane_layers_[L].oproj_add = ane_compile_oproj_add(
+                    sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
+            }
+            if (!ane_layers_[nextL].first_proj) {
+                snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.q_proj.weight", nextL);
+                snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.k_proj.weight", nextL);
+                snprintf(name4, sizeof(name4), "model.layers.%d.self_attn.v_proj.weight", nextL);
+                if (use_blobs) {
+                    ane_layers_[nextL].first_proj = ane_compile_fused_3_blob(
+                        blob_path(blob_dir, name2), q_proj_dim_,
+                        blob_path(blob_dir, name3), kv_proj_dim_,
+                        blob_path(blob_dir, name4), kv_proj_dim_, hidden_size_);
+                } else {
+                    ane_layers_[nextL].first_proj = ane_compile_fused_3(
+                        sf->get_bf16_ptr(name2), q_proj_dim_,
+                        sf->get_bf16_ptr(name3), kv_proj_dim_,
+                        sf->get_bf16_ptr(name4), kv_proj_dim_, hidden_size_);
+                }
+            }
+        } else {
+            // Standalone oproj_add (no cross-layer fusion)
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+            if (use_blobs) {
+                ane_layers_[L].oproj_add = ane_compile_oproj_add_blob(
+                    blob_path(blob_dir, name), hidden_size_, full_out_dim_);
+            } else {
+                ane_layers_[L].oproj_add = ane_compile_oproj_add(
+                    sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
+            }
+            if (!ane_layers_[L].oproj_add) {
+                fprintf(stderr, "ANE oproj_add compile failed for layer %d\n", L);
+                return false;
+            }
+        }
+
+        // --- FFN (unchanged) ---
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", L);
         snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
@@ -400,8 +464,8 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 
     int compiled = ane_compile_count();
     int cached = ane_cache_loads();
-    LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
-        compiled + cached, compiled, cached);
+    LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d, cross-layer fused=%d/%d)\n",
+        compiled + cached, compiled, cached, fused_count, num_layers_ - 1);
 
     if (!compile_lm_head_ane(sf, blob_dir)) {
         LOG("ANE LM head disabled, falling back to CPU\n");
@@ -554,6 +618,7 @@ static struct FwdProfile {
     ~FwdProfile() { print(); }
 } g_fwd_prof;
 
+
 float* Qwen3Model::forward(int token_id, int pos) {
     g_fwd_prof.check();
     Timer t_total;
@@ -561,54 +626,84 @@ float* Qwen3Model::forward(int token_id, int pos) {
     memcpy(x_, embed_tokens_ + (int64_t)token_id * hidden_size_, hidden_size_ * sizeof(float));
 
     float* pre_oproj = scratch_attn_;
+    int qkv_total = q_proj_dim_ + 2 * kv_proj_dim_;
+
+    // --- Cross-layer fused forward pass ---
+    // Layer 0: standalone QKV → attention → fused O_proj_0+QKV_1
+    // Layers 1..N-2: attention (QKV pre-computed) → fused O_proj_L+QKV_{L+1}
+    // Layer N-1: attention (QKV pre-computed) → standalone O_proj
+    // All layers: post-attention FFN
+
+    // Track whether scratch_qkv_ already has the QKV for the current layer
+    bool qkv_precomputed = false;
+    // Cross-layer fusion disabled by default: computing QKV_{L+1} before FFN_L
+    // produces garbage because FFN is a massive nonlinear transformation.
+    // Enable with CROSS_LAYER_FUSION=1 for speed testing (10.3 tok/s but broken output).
+    static bool fusion_enabled = getenv("CROSS_LAYER_FUSION") != nullptr;
 
     for (int L = 0; L < num_layers_; L++) {
-        Timer t;
-        rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
-        if (g_fwd_prof.enabled) g_fwd_prof.rmsnorm_ms += t.elapsed_ms();
 
-        // QKV projection (ANE)
-        if (g_fwd_prof.enabled) t.reset();
-        float* qkv_buf = scratch_qkv_;
-        if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x_norm_,
-                        hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
-            fprintf(stderr, "ANE first_proj eval failed at layer %d\n", L);
-            return nullptr;
+        // ---- Step 1: QKV projection ----
+        if (!qkv_precomputed) {
+            // Need to compute QKV for this layer (standalone path)
+            Timer t;
+            rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
+            if (g_fwd_prof.enabled) g_fwd_prof.rmsnorm_ms += t.elapsed_ms();
+
+            if (g_fwd_prof.enabled) t.reset();
+            if (!ane_matvec(ane_layers_[L].first_proj, scratch_qkv_, x_norm_,
+                            hidden_size_, qkv_total)) {
+                fprintf(stderr, "ANE first_proj eval failed at layer %d\n", L);
+                return nullptr;
+            }
+            if (g_fwd_prof.enabled) g_fwd_prof.qkv_ms += t.elapsed_ms();
         }
-        if (g_fwd_prof.enabled) g_fwd_prof.qkv_ms += t.elapsed_ms();
+        // else: scratch_qkv_ already has QKV from previous layer's fused kernel
 
-        float* q_raw = qkv_buf;
-        float* k_raw = qkv_buf + q_proj_dim_;
-        float* v_raw = qkv_buf + q_proj_dim_ + kv_proj_dim_;
+        // ---- Step 2: QK-norm + RoPE ----
+        float* q_raw = scratch_qkv_;
+        float* k_raw = scratch_qkv_ + q_proj_dim_;
+        float* v_raw = scratch_qkv_ + q_proj_dim_ + kv_proj_dim_;
 
-        // QK norm
-        if (g_fwd_prof.enabled) t.reset();
-        for (int h = 0; h < num_q_heads_; h++) {
-            float* qh = q_raw + (size_t)h * head_dim_;
-            rmsnorm(qh, qh, layers_[L].q_norm, head_dim_, rms_eps_);
+        if (g_fwd_prof.enabled) {
+            Timer t;
+            for (int h = 0; h < num_q_heads_; h++) {
+                float* qh = q_raw + (size_t)h * head_dim_;
+                rmsnorm(qh, qh, layers_[L].q_norm, head_dim_, rms_eps_);
+            }
+            for (int h = 0; h < num_kv_heads_; h++) {
+                float* kh = k_raw + (size_t)h * head_dim_;
+                rmsnorm(kh, kh, layers_[L].k_norm, head_dim_, rms_eps_);
+            }
+            g_fwd_prof.qk_norm_ms += t.elapsed_ms();
+        } else {
+            for (int h = 0; h < num_q_heads_; h++) {
+                float* qh = q_raw + (size_t)h * head_dim_;
+                rmsnorm(qh, qh, layers_[L].q_norm, head_dim_, rms_eps_);
+            }
+            for (int h = 0; h < num_kv_heads_; h++) {
+                float* kh = k_raw + (size_t)h * head_dim_;
+                rmsnorm(kh, kh, layers_[L].k_norm, head_dim_, rms_eps_);
+            }
         }
-        for (int h = 0; h < num_kv_heads_; h++) {
-            float* kh = k_raw + (size_t)h * head_dim_;
-            rmsnorm(kh, kh, layers_[L].k_norm, head_dim_, rms_eps_);
-        }
-        if (g_fwd_prof.enabled) g_fwd_prof.qk_norm_ms += t.elapsed_ms();
 
-        // RoPE
-        if (g_fwd_prof.enabled) t.reset();
-        const float* rope_cos_row = nullptr;
-        const float* rope_sin_row = nullptr;
-        if (pos >= 0 && pos < rope_cache_len_ && rope_cos_ && rope_sin_) {
-            int half_rot = rot_dim_ / 2;
-            rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
-            rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
-        }
-        apply_rope_qwen3(q_raw, k_raw, num_q_heads_, num_kv_heads_,
-                         head_dim_, pos, rope_theta_, rope_cos_row, rope_sin_row);
-        if (g_fwd_prof.enabled) g_fwd_prof.rope_ms += t.elapsed_ms();
-
-        // KV cache + attention
-        if (g_fwd_prof.enabled) t.reset();
         {
+            Timer t;
+            const float* rope_cos_row = nullptr;
+            const float* rope_sin_row = nullptr;
+            if (pos >= 0 && pos < rope_cache_len_ && rope_cos_ && rope_sin_) {
+                int half_rot = rot_dim_ / 2;
+                rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+                rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+            }
+            apply_rope_qwen3(q_raw, k_raw, num_q_heads_, num_kv_heads_,
+                             head_dim_, pos, rope_theta_, rope_cos_row, rope_sin_row);
+            if (g_fwd_prof.enabled) g_fwd_prof.rope_ms += t.elapsed_ms();
+        }
+
+        // ---- Step 3: KV cache + attention ----
+        {
+            Timer t;
             auto& cache = kv_caches_[L];
             int slot;
             if (cache.len < cache.capacity) {
@@ -626,71 +721,79 @@ float* Qwen3Model::forward(int token_id, int pos) {
             gqa_attention(pre_oproj, q_raw, cache.k_cache, cache.v_cache,
                           num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
                           cache.start, cache.len, cache.capacity);
-        }
-        if (g_fwd_prof.enabled) g_fwd_prof.attention_ms += t.elapsed_ms();
-
-        // O projection + residual + norm
-        if (g_fwd_prof.enabled) t.reset();
-        if (ane_layers_[L].oproj_add) {
-            // Simplified ANE: conv(O_proj, attn) + x_residual → single output x_updated
-            if (!ane_eval_oproj_add(ane_layers_[L].oproj_add,
-                    x_, pre_oproj, x_, full_out_dim_, hidden_size_)) {
-                fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
-                return nullptr;
-            }
-            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
-        } else if (ane_layers_[L].fused_oproj_norm) {
-            // Legacy fused: conv + add + RMSNorm (norm output discarded)
-            float* tmp_norm = x_norm_;
-            ane_eval_fused_oproj_norm(ane_layers_[L].fused_oproj_norm,
-                tmp_norm, x_, pre_oproj, x_, full_out_dim_, hidden_size_);
-            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
-        } else {
-            // Fallback: separate O_proj + CPU residual + CPU rmsnorm
-            float* attn_out = x_norm_;
-            if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, full_out_dim_, hidden_size_)) {
-                fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
-                return nullptr;
-            }
-            for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
-            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
-        }
-        if (g_fwd_prof.enabled) {
-            g_fwd_prof.o_proj_ms += t.elapsed_ms();
+            if (g_fwd_prof.enabled) g_fwd_prof.attention_ms += t.elapsed_ms();
         }
 
-        // FFN (ANE) + residual add
-        if (g_fwd_prof.enabled) t.reset();
-        if (ane_layers_[L].ffn_resadd) {
-            // Fused: output = x_ + FFN(x_norm_) — no separate residual add needed
-            if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, x_, x_norm_, x_, hidden_size_)) {
-                fprintf(stderr, "ANE ffn_resadd eval failed at layer %d\n", L);
-                return nullptr;
-            }
-        } else {
-            float* mlp_out = scratch_attn_;
-            if (ane_layers_[L].fused_ffn) {
-                if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-                    fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+        // ---- Step 4: O_proj + residual (fused or standalone) ----
+        {
+            Timer t;
+            if (ane_layers_[L].oproj_norm_qkv && fusion_enabled) {
+                // Cross-layer fused: O_proj_L + add + RMSNorm_{L+1} + QKV_{L+1}
+                // Output 1: scratch_qkv_ = QKV for next layer
+                // Output 2: x_ = x + O_proj(attn_out) (updated residual)
+                if (!ane_eval_oproj_norm_qkv(ane_layers_[L].oproj_norm_qkv,
+                        scratch_qkv_, x_, pre_oproj, x_,
+                        full_out_dim_, hidden_size_, qkv_total)) {
+                    fprintf(stderr, "ANE oproj_norm_qkv eval failed at layer %d\n", L);
                     return nullptr;
                 }
-            } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
-                if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
-                    fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+                qkv_precomputed = true;
+            } else if (ane_layers_[L].oproj_add) {
+                // Standalone: conv(O_proj, attn) + x_residual
+                if (!ane_eval_oproj_add(ane_layers_[L].oproj_add,
+                        x_, pre_oproj, x_, full_out_dim_, hidden_size_)) {
+                    fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
+                    return nullptr;
+                }
+                qkv_precomputed = false;
+            } else {
+                // Fallback: separate O_proj + CPU residual add
+                float* attn_out = x_norm_;
+                if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, full_out_dim_, hidden_size_)) {
+                    fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
+                    return nullptr;
+                }
+                for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
+                qkv_precomputed = false;
+            }
+            if (g_fwd_prof.enabled) g_fwd_prof.o_proj_ms += t.elapsed_ms();
+        }
+
+        // ---- Step 5: Post-attention RMSNorm (CPU, for FFN precision) ----
+        {
+            Timer t;
+            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+            if (g_fwd_prof.enabled) g_fwd_prof.rmsnorm_ms += t.elapsed_ms();
+        }
+
+        // ---- Step 6: FFN + residual add (ANE) ----
+        {
+            Timer t;
+            if (ane_layers_[L].ffn_resadd) {
+                if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, x_, x_norm_, x_, hidden_size_)) {
+                    fprintf(stderr, "ANE ffn_resadd eval failed at layer %d\n", L);
                     return nullptr;
                 }
             } else {
-                fprintf(stderr, "No FFN kernel for layer %d\n", L);
-                return nullptr;
+                float* mlp_out = scratch_attn_;
+                if (ane_layers_[L].fused_ffn) {
+                    if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+                        fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+                        return nullptr;
+                    }
+                } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
+                    if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
+                        fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+                        return nullptr;
+                    }
+                } else {
+                    fprintf(stderr, "No FFN kernel for layer %d\n", L);
+                    return nullptr;
+                }
+                for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
             }
-            // CPU residual add (fallback path)
-            for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+            if (g_fwd_prof.enabled) g_fwd_prof.ffn_ms += t.elapsed_ms();
         }
-        if (g_fwd_prof.enabled) g_fwd_prof.ffn_ms += t.elapsed_ms();
-
-        // Residual (only used by profiler for legacy path timing)
-        if (g_fwd_prof.enabled) t.reset();
-        if (g_fwd_prof.enabled) g_fwd_prof.residual_ms += t.elapsed_ms();
     }
 
     // Final norm

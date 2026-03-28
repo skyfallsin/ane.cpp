@@ -1168,6 +1168,296 @@ bool ane_eval_oproj_add(ANEKernel* k, float* x_updated,
     return ane_eval_multi(k, ins, in_chs, outs, out_chs);
 }
 
+
+// ============ Cross-layer fusion: O_proj_L + RMSNorm_{L+1} + QKV_{L+1} ============
+// Fuses O_proj of layer L with input RMSNorm and QKV of layer L+1
+// 2 inputs:  attn_out [1, in_dim, 1, SP], x_residual [1, dim, 1, SP]
+// 2 outputs: qkv [1, q_out+k_out+v_out, 1, SP], x_updated [1, dim, 1, SP]
+// Saves 35 dispatches per token (113->78) at 363us each = ~12.7ms
+
+static id mil_gen_oproj_norm_qkv(int dim, int in_dim, int q_out, int k_out, int v_out) {
+    int total_qkv = q_out + k_out + v_out;
+    std::string s;
+    char buf[1024];
+    s += MIL_HEADER;
+
+    // 2 runtime inputs: attn_out and x_residual
+    snprintf(buf, sizeof(buf),
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> attn,"
+        " tensor<fp16, [1, %d, 1, %d]> xres) {\n", in_dim, SP, dim, SP);
+    s += buf;
+
+    // Conv shared params
+    s += "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+         "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+         "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n";
+
+    // --- O_proj conv ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wo = const()[name = tensor<string, []>(\"Wo\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/oproj.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        dim, in_dim, dim, in_dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> oproj = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wo, x = attn)"
+        "[name = tensor<string, []>(\"op\")];\n", dim, SP);
+    s += buf;
+
+    // --- Residual add ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> x = add(x = xres, y = oproj)"
+        "[name = tensor<string, []>(\"ad\")];\n", dim, SP);
+    s += buf;
+
+    // --- RMSNorm (pre-scaled by 1/8 for fp16 safety) ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> rsk = const()[name = tensor<string, []>(\"rsk\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/rms_scale.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> xsc = mul(x = x, y = rsk)"
+        "[name = tensor<string, []>(\"xsc\")];\n", dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> sq = mul(x = xsc, y = xsc)"
+        "[name = tensor<string, []>(\"sq\")];\n", dim, SP);
+    s += buf;
+    s += "        tensor<int32, [1]> axes = const()[name = tensor<string, []>(\"ax\"), val = tensor<int32, [1]>([1])];\n"
+         "        tensor<bool, []> kd = const()[name = tensor<string, []>(\"kd\"), val = tensor<bool, []>(true)];\n";
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ss = reduce_sum(x = sq, axes = axes, keep_dims = kd)"
+        "[name = tensor<string, []>(\"rs\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> di = const()[name = tensor<string, []>(\"di\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/dim_inv.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ms = mul(x = ss, y = di)"
+        "[name = tensor<string, []>(\"ms\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ep = const()[name = tensor<string, []>(\"ep\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/eps.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ae = add(x = ms, y = ep)"
+        "[name = tensor<string, []>(\"ae\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sr = sqrt(x = ae)"
+        "[name = tensor<string, []>(\"sr\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> on = const()[name = tensor<string, []>(\"on\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/ones.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sc = real_div(x = on, y = sr)"
+        "[name = tensor<string, []>(\"is\")];\n", SP);
+    s += buf;
+    // Apply inv_rms to SCALED x (scale cancels: (x/k)*(k/rms(x)) = x/rms(x))
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> xs = mul(x = xsc, y = sc)"
+        "[name = tensor<string, []>(\"xs\")];\n", dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> wn = const()[name = tensor<string, []>(\"wn\"), "
+        "val = tensor<fp16, [1, %d, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/nw.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        dim, SP, dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> normed = mul(x = xs, y = wn)"
+        "[name = tensor<string, []>(\"nm\")];\n", dim, SP);
+    s += buf;
+
+    // --- QKV projections on normed output ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wq = const()[name = tensor<string, []>(\"Wq\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wq.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        q_out, dim, q_out, dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wk = const()[name = tensor<string, []>(\"Wk\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wk.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        k_out, dim, k_out, dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wv = const()[name = tensor<string, []>(\"Wv\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wv.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        v_out, dim, v_out, dim);
+    s += buf;
+
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> yq = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wq, x = normed)"
+        "[name = tensor<string, []>(\"cq\")];\n", q_out, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> yk = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wk, x = normed)"
+        "[name = tensor<string, []>(\"ck\")];\n", k_out, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> yv = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wv, x = normed)"
+        "[name = tensor<string, []>(\"cv\")];\n", v_out, SP);
+    s += buf;
+
+    // Concat Q,K,V along channel axis
+    s += "        tensor<bool, []> ci = const()[name = tensor<string, []>(\"ci\"), val = tensor<bool, []>(false)];\n"
+         "        tensor<int32, []> ax = const()[name = tensor<string, []>(\"ax\"), val = tensor<int32, []>(1)];\n";
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> qkv = concat(values = (yq, yk, yv), axis = ax, "
+        "interleave = ci)[name = tensor<string, []>(\"ct\")];\n", total_qkv, SP);
+    s += buf;
+
+    // Two outputs: QKV (for next layer attention) and x (updated residual)
+    s += "    } -> (qkv, x);\n}\n";
+    return ns_data(s.c_str(), s.size());
+}
+
+ANEKernel* ane_compile_oproj_norm_qkv(const uint16_t* oproj_bf16,
+                                       const float* norm_weight,
+                                       const uint16_t* q_bf16, int q_out,
+                                       const uint16_t* k_bf16, int k_out,
+                                       const uint16_t* v_bf16, int v_out,
+                                       int dim, int in_dim, float eps) {
+    void* pool = objc_autoreleasePoolPush();
+    int total_qkv = q_out + k_out + v_out;
+
+    id w_oproj = build_weight_blob(oproj_bf16, dim * in_dim);
+    id w_nw = build_norm_weight_blob(norm_weight, dim);
+    id w_di = build_scalar_blob(1.0f / dim);
+    id w_ep = build_scalar_blob(eps);
+    id w_on = build_scalar_blob(1.0f);
+    id w_rsk = build_scalar_blob(1.0f / 8.0f);
+    id w_q = build_weight_blob(q_bf16, q_out * dim);
+    id w_k = build_weight_blob(k_bf16, k_out * dim);
+    id w_v = build_weight_blob(v_bf16, v_out * dim);
+
+    id keys[] = {
+        ns_str("@model_path/weights/oproj.bin"),
+        ns_str("@model_path/weights/nw.bin"),
+        ns_str("@model_path/weights/dim_inv.bin"),
+        ns_str("@model_path/weights/eps.bin"),
+        ns_str("@model_path/weights/ones.bin"),
+        ns_str("@model_path/weights/rms_scale.bin"),
+        ns_str("@model_path/weights/wq.bin"),
+        ns_str("@model_path/weights/wk.bin"),
+        ns_str("@model_path/weights/wv.bin"),
+    };
+    id values[] = {
+        ns_weight_entry(w_oproj),
+        ns_weight_entry(w_nw),
+        ns_weight_entry(w_di),
+        ns_weight_entry(w_ep),
+        ns_weight_entry(w_on),
+        ns_weight_entry(w_rsk),
+        ns_weight_entry(w_q),
+        ns_weight_entry(w_k),
+        ns_weight_entry(w_v),
+    };
+    id wdict = ns_dict(keys, values, 9);
+
+    id mil = mil_gen_oproj_norm_qkv(dim, in_dim, q_out, k_out, v_out);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    size_t out_sizes[2] = {
+        (size_t)total_qkv * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 2, out_sizes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+ANEKernel* ane_compile_oproj_norm_qkv_blob(const std::string& oproj_path,
+                                            const float* norm_weight,
+                                            const std::string& q_path, int q_out,
+                                            const std::string& k_path, int k_out,
+                                            const std::string& v_path, int v_out,
+                                            int dim, int in_dim, float eps) {
+    void* pool = objc_autoreleasePoolPush();
+    int total_qkv = q_out + k_out + v_out;
+
+    id w_oproj = load_blob_file(oproj_path);
+    id w_q = load_blob_file(q_path);
+    id w_k = load_blob_file(k_path);
+    id w_v = load_blob_file(v_path);
+    if (!w_oproj || !w_q || !w_k || !w_v) {
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
+
+    id w_nw = build_norm_weight_blob(norm_weight, dim);
+    id w_di = build_scalar_blob(1.0f / dim);
+    id w_ep = build_scalar_blob(eps);
+    id w_on = build_scalar_blob(1.0f);
+    id w_rsk = build_scalar_blob(1.0f / 8.0f);
+
+    id keys[] = {
+        ns_str("@model_path/weights/oproj.bin"),
+        ns_str("@model_path/weights/nw.bin"),
+        ns_str("@model_path/weights/dim_inv.bin"),
+        ns_str("@model_path/weights/eps.bin"),
+        ns_str("@model_path/weights/ones.bin"),
+        ns_str("@model_path/weights/rms_scale.bin"),
+        ns_str("@model_path/weights/wq.bin"),
+        ns_str("@model_path/weights/wk.bin"),
+        ns_str("@model_path/weights/wv.bin"),
+    };
+    id values[] = {
+        ns_weight_entry(w_oproj),
+        ns_weight_entry(w_nw),
+        ns_weight_entry(w_di),
+        ns_weight_entry(w_ep),
+        ns_weight_entry(w_on),
+        ns_weight_entry(w_rsk),
+        ns_weight_entry(w_q),
+        ns_weight_entry(w_k),
+        ns_weight_entry(w_v),
+    };
+    id wdict = ns_dict(keys, values, 9);
+
+    id mil = mil_gen_oproj_norm_qkv(dim, in_dim, q_out, k_out, v_out);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    size_t out_sizes[2] = {
+        (size_t)total_qkv * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 2, out_sizes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+bool ane_eval_oproj_norm_qkv(ANEKernel* k, float* qkv, float* x_updated,
+                              const float* attn_out, const float* x_residual,
+                              int in_dim, int dim, int qkv_dim) {
+    float* ins[2] = { (float*)attn_out, (float*)x_residual };
+    int in_chs[2] = { in_dim, dim };
+    float* outs[2] = { qkv, x_updated };
+    int out_chs[2] = { qkv_dim, dim };
+    return ane_eval_multi(k, ins, in_chs, outs, out_chs);
+}
+
 // ============ Fused O_proj + add + RMSNorm + SwiGLU FFN ============
 // The mega-kernel: 2 runtime inputs, 4 const convs, RMSNorm, SiLU
 // This replaces 2 ANE dispatches (oproj_norm + FFN) with 1
