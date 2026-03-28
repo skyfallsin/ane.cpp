@@ -63,15 +63,17 @@ void apply_rope_cached(float* q, float* k, int n_q_heads, int n_kv_heads,
 }
 
 void softmax(float* x, int n) {
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > max_val) max_val = x[i];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
+    // vDSP-accelerated softmax
+    float max_val;
+    vDSP_maxv(x, 1, &max_val, (vDSP_Length)n);
+    float neg_max = -max_val;
+    vDSP_vsadd(x, 1, &neg_max, x, 1, (vDSP_Length)n);  // x -= max
+    int vn = n;
+    vvexpf(x, x, &vn);                                    // x = exp(x)
+    float sum;
+    vDSP_sve(x, 1, &sum, (vDSP_Length)n);                 // sum(x)
     float inv = 1.0f / sum;
-    vDSP_vsmul(x, 1, &inv, x, 1, (vDSP_Length)n);
+    vDSP_vsmul(x, 1, &inv, x, 1, (vDSP_Length)n);         // x /= sum
 }
 
 void matvec(float* y, const float* W, const float* x, int out_dim, int in_dim) {
