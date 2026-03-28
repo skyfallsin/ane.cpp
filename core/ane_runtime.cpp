@@ -397,6 +397,51 @@ static id mil_gen_fused_ffn(int dim, int inter_ch) {
     return ns_data(buf, n);
 }
 
+// ============ Fused FFN + residual add ============
+// 2 inputs: x_norm [dim], x_residual [dim]
+// 1 output: x_residual + SwiGLU_FFN(x_norm)
+
+static id mil_gen_fused_ffn_resadd(int dim, int inter_ch) {
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> xnorm,"
+        " tensor<fp16, [1, %d, 1, %d]> xres) {\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wg = const()[name = tensor<string, []>(\"Wg\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wg.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wu = const()[name = tensor<string, []>(\"Wu\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wu.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wd = const()[name = tensor<string, []>(\"Wd\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wd.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wg, x = xnorm)[name = tensor<string, []>(\"cg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> up = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wu, x = xnorm)[name = tensor<string, []>(\"cu\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> sig = sigmoid(x = gate)[name = tensor<string, []>(\"sg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> silu = mul(x = gate, y = sig)[name = tensor<string, []>(\"sl\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> fused = mul(x = silu, y = up)[name = tensor<string, []>(\"fu\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> ffn = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wd, x = fused)[name = tensor<string, []>(\"cd\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = add(x = xres, y = ffn)"
+        "[name = tensor<string, []>(\"ra\")];\n"
+        "    } -> (y);\n"
+        "}\n",
+        dim, SP, dim, SP,
+        inter_ch, dim, inter_ch, dim,
+        inter_ch, dim, inter_ch, dim,
+        dim, inter_ch, dim, inter_ch,
+        inter_ch, SP, inter_ch, SP,
+        inter_ch, SP, inter_ch, SP, inter_ch, SP,
+        dim, SP,
+        dim, SP);
+    return ns_data(buf, n);
+}
+
 // ============ Chunked FFN: accumulator-chain MIL ============
 // Input: [1, 2*dim, 1, SP] = [x | accumulator] packed in channels
 // Output: [1, dim, 1, SP] = acc + down_proj(silu(gate(x)) * up(x))
@@ -768,8 +813,9 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->fused_oproj_norm);
     ane_free(lk->fused_oproj_ffn);
     ane_free(lk->oproj_add);
+    ane_free(lk->ffn_resadd);
     ane_free_chunked_ffn(&lk->chunked_ffn);
-    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = lk->fused_oproj_ffn = lk->oproj_add = nullptr;
+    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = lk->fused_oproj_ffn = lk->oproj_add = lk->ffn_resadd = nullptr;
 }
 
 // ============ High-level compile functions ============
@@ -1370,6 +1416,64 @@ ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_b
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
     objc_autoreleasePoolPop(pool);
     return r;
+}
+
+ANEKernel* ane_compile_fused_ffn_resadd(const uint16_t* gate_bf16, const uint16_t* up_bf16,
+                                         const uint16_t* down_bf16, int dim, int inter_ch) {
+    void* pool = objc_autoreleasePoolPush();
+    id wg = build_weight_blob(gate_bf16, inter_ch * dim);
+    id wu = build_weight_blob(up_bf16, inter_ch * dim);
+    id wd = build_weight_blob(down_bf16, dim * inter_ch);
+
+    id keys[]   = { ns_str("@model_path/weights/wg.bin"),
+                    ns_str("@model_path/weights/wu.bin"),
+                    ns_str("@model_path/weights/wd.bin") };
+    id values[] = { ns_weight_entry(wg), ns_weight_entry(wu), ns_weight_entry(wd) };
+    id wdict = ns_dict(keys, values, 3);
+
+    id mil = mil_gen_fused_ffn_resadd(dim, inter_ch);
+    size_t in_sizes[2] = {
+        (size_t)dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+ANEKernel* ane_compile_fused_ffn_resadd_blob(const std::string& gate_path, const std::string& up_path,
+                                              const std::string& down_path, int dim, int inter_ch) {
+    void* pool = objc_autoreleasePoolPush();
+    id wg = load_blob_file(gate_path);
+    id wu = load_blob_file(up_path);
+    id wd = load_blob_file(down_path);
+    if (!wg || !wu || !wd) { objc_autoreleasePoolPop(pool); return nullptr; }
+
+    id keys[]   = { ns_str("@model_path/weights/wg.bin"),
+                    ns_str("@model_path/weights/wu.bin"),
+                    ns_str("@model_path/weights/wd.bin") };
+    id values[] = { ns_weight_entry(wg), ns_weight_entry(wu), ns_weight_entry(wd) };
+    id wdict = ns_dict(keys, values, 3);
+
+    id mil = mil_gen_fused_ffn_resadd(dim, inter_ch);
+    size_t in_sizes[2] = {
+        (size_t)dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+bool ane_eval_fused_ffn_resadd(ANEKernel* k, float* output,
+                                const float* x_norm, const float* x_residual, int dim) {
+    float* ins[2] = { (float*)x_norm, (float*)x_residual };
+    int in_chs[2] = { dim, dim };
+    float* outs[1] = { output };
+    int out_chs[1] = { dim };
+    return ane_eval_multi(k, ins, in_chs, outs, out_chs);
 }
 
 // ============ Blob file loading ============

@@ -29,6 +29,7 @@ struct LayerANEKernels {
     ANEKernel* fused_oproj_norm = nullptr;  // conv(O_proj) → add(res) → RMSNorm [2 outputs: x_norm, x_updated]
     ANEKernel* fused_oproj_ffn = nullptr;   // conv(O_proj) → add(res) → RMSNorm → SwiGLU FFN [2 outputs: ffn_out, x_updated]
     ANEKernel* oproj_add = nullptr;         // conv(O_proj) → add(res) [1 output: x_updated] — no redundant norm
+    ANEKernel* ffn_resadd = nullptr;        // SwiGLU FFN + residual add [2 inputs: x_norm, x_res → 1 output: x_res + ffn(x_norm)]
 };
 
 // Global state
@@ -49,6 +50,16 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
                                 int in_dim);
 ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_bf16,
                                   const uint16_t* down_bf16, int dim, int inter_ch);
+
+// Fused FFN + residual add: output = x_residual + SwiGLU_FFN(x_norm)
+// 2 inputs: x_norm [dim], x_residual [dim]
+// 1 output: y [dim]
+ANEKernel* ane_compile_fused_ffn_resadd(const uint16_t* gate_bf16, const uint16_t* up_bf16,
+                                         const uint16_t* down_bf16, int dim, int inter_ch);
+ANEKernel* ane_compile_fused_ffn_resadd_blob(const std::string& gate_path, const std::string& up_path,
+                                              const std::string& down_path, int dim, int inter_ch);
+bool ane_eval_fused_ffn_resadd(ANEKernel* k, float* output,
+                                const float* x_norm, const float* x_residual, int dim);
 bool ane_compile_chunked_ffn(ChunkedFFN* out, const uint16_t* gate_bf16,
                               const uint16_t* up_bf16, const uint16_t* down_bf16,
                               int dim, int inter_ch, int num_chunks);
