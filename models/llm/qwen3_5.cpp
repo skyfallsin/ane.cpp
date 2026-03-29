@@ -70,6 +70,9 @@ Qwen35Args Qwen35Args::from_json(const json& j) {
 
 Qwen35Model::~Qwen35Model() {
     free(embed_tokens_);
+    if (!tie_word_embeddings_) {
+        free(lm_head_);
+    }
     free(final_norm_);
     free(x_);
     free(x_norm_);
@@ -154,6 +157,7 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
     full_kv_dim_ = num_kv_heads_ * head_dim_;
     full_out_dim_ = num_q_heads_ * head_dim_;
     attn_output_gate_ = args.attn_output_gate;
+    tie_word_embeddings_ = args.tie_word_embeddings;
     layer_types_ = args.layer_types;
 }
 
@@ -273,6 +277,13 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
     embed_tokens_ = sf->load_bf16_to_f32("model.language_model.embed_tokens.weight",
                                            (int64_t)vocab_size_ * hidden_size_);
     if (!embed_tokens_) return false;
+
+    if (tie_word_embeddings_) {
+        lm_head_ = embed_tokens_;
+    } else {
+        lm_head_ = sf->load_bf16_to_f32("lm_head.weight", (int64_t)vocab_size_ * hidden_size_);
+        if (!lm_head_) return false;
+    }
 
     final_norm_ = sf->load_norm_weight("model.language_model.norm.weight", hidden_size_);
     if (!final_norm_) return false;
@@ -476,15 +487,12 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 
 bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir) {
     bool use_blobs = !blob_dir.empty();
+    const char* lm_name = tie_word_embeddings_ ? "model.language_model.embed_tokens.weight" : "lm_head.weight";
 
-    // For blob mode, we need the embed blob; for bf16 mode, the bf16 pointer
-    const uint16_t* embed_bf16 = nullptr;
-    if (!use_blobs) {
-        embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
-        if (!embed_bf16) {
-            fprintf(stderr, "ANE LM head: missing embed_tokens BF16 weights\n");
-            return false;
-        }
+    const uint16_t* lm_bf16 = sf->get_bf16_ptr(lm_name);
+    if (!lm_bf16) {
+        fprintf(stderr, "ANE LM head: missing BF16 weights for %s\n", lm_name);
+        return false;
     }
 
     int chunk = lm_head_chunk_;
@@ -502,17 +510,11 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
         LOG("    LM head chunk %d/%d...\r", c + 1, chunks);
 
         if (use_blobs) {
-            // LM head reuses embed_tokens weight, chunked by row offset
-            // Blob was written as one file; we need per-chunk blobs or fall back to bf16
-            // For now: fall back to bf16 for LM head since embed_tokens is one big blob
-            embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
-            if (!embed_bf16) return false;
-            const uint16_t* chunk_w = embed_bf16 + (int64_t)offset * hidden_size_;
-            lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
-        } else {
-            const uint16_t* chunk_w = embed_bf16 + (int64_t)offset * hidden_size_;
-            lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
+            // LM head is chunked dynamically, so keep using the BF16 source tensor here.
+            (void)use_blobs;
         }
+        const uint16_t* chunk_w = lm_bf16 + (int64_t)offset * hidden_size_;
+        lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
         if (!lm_head_kernels_[c]) {
             fprintf(stderr, "\nANE LM head: compile failed at chunk %d/%d\n", c + 1, chunks);
             free_lm_head_ane();
@@ -740,10 +742,10 @@ float* Qwen35Model::forward(int token, int pos) {
         }
         if (!ok) {
             free_lm_head_ane();
-            matvec(logits_, embed_tokens_, x_, vocab_size_, hidden_size_);
+            matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
         }
     } else {
-        matvec(logits_, embed_tokens_, x_, vocab_size_, hidden_size_);
+        matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
     }
 
     return logits_;

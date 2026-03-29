@@ -148,6 +148,7 @@ private:
     int full_kv_dim_ = 0;
     int full_out_dim_ = 0;
     bool attn_output_gate_ = true;
+    bool tie_word_embeddings_ = true;
 
     static constexpr int MAX_SEQ_LEN = 4096;
     static constexpr int KV_CACHE_CAPACITY = 2048;
@@ -199,6 +200,7 @@ private:
     // Model data
     std::vector<LayerWeights> layers_;
     float* embed_tokens_ = nullptr;
+    float* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
 
     std::vector<DeltaNetState> delta_states_;
