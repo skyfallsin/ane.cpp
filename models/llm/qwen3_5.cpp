@@ -410,7 +410,7 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
             return false;
         }
 
-        // O projection
+        // O projection + residual add
         int attn_dim;
         if (layer_types_[L] == LayerType::LinearAttention) {
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
@@ -420,12 +420,12 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
             attn_dim = full_out_dim_;
         }
         if (use_blobs) {
-            ane_layers_[L].o_proj = ane_compile_matmul_blob(blob_path(blob_dir, name), hidden_size_, attn_dim);
+            ane_layers_[L].oproj_add = ane_compile_oproj_add_blob(blob_path(blob_dir, name), hidden_size_, attn_dim);
         } else {
-            ane_layers_[L].o_proj = ane_compile_matmul(sf->get_bf16_ptr(name), hidden_size_, attn_dim);
+            ane_layers_[L].oproj_add = ane_compile_oproj_add(sf->get_bf16_ptr(name), hidden_size_, attn_dim);
         }
-        if (!ane_layers_[L].o_proj) {
-            fprintf(stderr, "ANE o_proj compile failed for layer %d\n", L);
+        if (!ane_layers_[L].oproj_add) {
+            fprintf(stderr, "ANE oproj_add compile failed for layer %d\n", L);
             return false;
         }
 
@@ -436,18 +436,29 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 
         int ffn_chunks = ane_ffn_chunk_count(hidden_size_, intermediate_size_);
         if (ffn_chunks <= 1) {
-            // Try fused single kernel
+            // Try fused FFN + residual add first
             if (use_blobs) {
-                ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
+                ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd_blob(
                     blob_path(blob_dir, name), blob_path(blob_dir, name2),
                     blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
             } else {
-                ane_layers_[L].fused_ffn = ane_compile_fused_ffn(
+                ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd(
                     sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
                     sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
             }
+            if (!ane_layers_[L].ffn_resadd) {
+                if (use_blobs) {
+                    ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
+                        blob_path(blob_dir, name), blob_path(blob_dir, name2),
+                        blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
+                } else {
+                    ane_layers_[L].fused_ffn = ane_compile_fused_ffn(
+                        sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
+                        sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+                }
+            }
         }
-        if (!ane_layers_[L].fused_ffn) {
+        if (!ane_layers_[L].ffn_resadd && !ane_layers_[L].fused_ffn) {
             // Fall back to chunked FFN
             if (ffn_chunks <= 1) ffn_chunks = ane_ffn_chunk_count(hidden_size_, intermediate_size_);
             if (ffn_chunks <= 1) ffn_chunks = 2; // force chunking
@@ -688,39 +699,50 @@ float* Qwen35Model::forward(int token, int pos) {
             if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) return nullptr;
         }
 
-        // O projection (ANE)
+        // O projection + residual add (ANE)
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
-        float* attn_out = x_norm_;
-        if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
-            fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
-            return nullptr;
+        if (ane_layers_[L].oproj_add) {
+            if (!ane_eval_oproj_add(ane_layers_[L].oproj_add, x_, pre_oproj, x_, attn_dim, hidden_size_)) {
+                fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
+                return nullptr;
+            }
+        } else {
+            float* attn_out = x_norm_;
+            if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
+                fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
+                return nullptr;
+            }
+            for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
         }
-
-        // Residual 1
-        for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
 
         // Post-attention norm
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
-        // FFN (ANE) — fused or chunked
-        float* mlp_out = scratch_attn_;
-        if (ane_layers_[L].fused_ffn) {
-            if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-                fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
-                return nullptr;
-            }
-        } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
-            if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
-                fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+        // FFN (ANE) — fused residual, fused plain, or chunked
+        if (ane_layers_[L].ffn_resadd) {
+            if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, x_, x_norm_, x_, hidden_size_)) {
+                fprintf(stderr, "ANE ffn_resadd eval failed at layer %d\n", L);
                 return nullptr;
             }
         } else {
-            fprintf(stderr, "No FFN kernel for layer %d\n", L);
-            return nullptr;
-        }
+            float* mlp_out = scratch_attn_;
+            if (ane_layers_[L].fused_ffn) {
+                if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+                    fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+                    return nullptr;
+                }
+            } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
+                if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
+                    fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+                    return nullptr;
+                }
+            } else {
+                fprintf(stderr, "No FFN kernel for layer %d\n", L);
+                return nullptr;
+            }
 
-        // Residual 2
-        for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+            for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+        }
     }
 
     // Final norm
