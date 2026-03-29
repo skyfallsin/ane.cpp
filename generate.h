@@ -19,6 +19,11 @@ struct GenerationResponse {
     double generation_tps = 0.0;
 };
 
+struct DraftModelContext {
+    LLMModel* model = nullptr;
+    Tokenizer* tokenizer = nullptr;
+};
+
 // Multi-turn: accepts full message history
 void stream_generate(
     LLMModel& model,
@@ -27,7 +32,8 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    DraftModelContext* draft = nullptr);
 
 // Single-prompt convenience overload
 void stream_generate(
@@ -37,6 +43,7 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    DraftModelContext* draft = nullptr);
 
 } // namespace ane_lm

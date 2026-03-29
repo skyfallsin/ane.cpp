@@ -27,7 +27,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  chat        Interactive multi-turn chat\n");
     fprintf(stderr, "  convert     Convert model weights from BF16 to FP16\n");
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --model <path>    Path to model directory (required)\n");
+    fprintf(stderr, "  --model <path>    Path to target model directory (required)\n");
+    fprintf(stderr, "  --draft-model <path> Path to optional draft model directory\n");
     fprintf(stderr, "  --prompt <text>   Input prompt (generate only, default: \"Hello\")\n");
     fprintf(stderr, "  --max-tokens N    Max tokens per response (default: unlimited)\n");
     fprintf(stderr, "  --temp T          Temperature (default: 0.6)\n");
@@ -42,6 +43,7 @@ static void print_usage(const char* prog) {
 
 struct Args {
     const char* model_dir = nullptr;
+    const char* draft_model_dir = nullptr;
     const char* prompt = "Hello";
     float temperature = 0.6f;
     int max_tokens = 0;
@@ -55,6 +57,8 @@ static Args parse_args(int argc, char* argv[], int start) {
     for (int i = start; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             args.model_dir = argv[++i];
+        } else if (strcmp(argv[i], "--draft-model") == 0 && i + 1 < argc) {
+            args.draft_model_dir = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             args.prompt = argv[++i];
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
@@ -74,7 +78,8 @@ static Args parse_args(int argc, char* argv[], int start) {
     return args;
 }
 
-static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
+static int cmd_generate(LLMModel& model, Tokenizer& tokenizer,
+                        DraftModelContext* draft, const Args& args) {
     LOG("Prompt: \"%s\"\n", args.prompt);
 
     SamplingParams sampling;
@@ -95,7 +100,7 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
                 fprintf(stderr, "%s", r.text.c_str());
             }
             last = r;
-        });
+        }, draft);
 
     fprintf(stderr, "\n==========\n");
     fprintf(stderr, "Prompt: %d tokens, %.3f tokens-per-sec\n",
@@ -105,7 +110,8 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
     return 0;
 }
 
-static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
+static int cmd_chat(LLMModel& model, Tokenizer& tokenizer,
+                    DraftModelContext* draft, const Args& args) {
     std::vector<std::pair<std::string, std::string>> messages;
     char buf[4096];
 
@@ -132,6 +138,7 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
 
         // Reset model state and generate with full history
         model.reset();
+        if (draft && draft->model) draft->model->reset();
 
         SamplingParams sampling;
         sampling.temperature = args.temperature;
@@ -151,7 +158,7 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
                     assistant_text += r.text;
                 }
                 last = r;
-            });
+            }, draft);
 
         fprintf(stderr, "\n");
 
@@ -242,6 +249,7 @@ int main(int argc, char* argv[]) {
 
     LOG("=== ane-lm: Apple Neural Engine LLM Inference ===\n");
     LOG("Model: %s\n", args.model_dir);
+    if (args.draft_model_dir) LOG("Draft model: %s\n", args.draft_model_dir);
     LOG("Mode: %s\n", is_chat ? "chat" : "generate");
     LOG("Temperature: %.2f, Max tokens: %d\n", args.temperature, args.max_tokens);
     LOG("ANE compile cache: %s\n", args.ane_cache ? "enabled" : "disabled");
@@ -249,10 +257,20 @@ int main(int argc, char* argv[]) {
     // Load model + tokenizer
     std::unique_ptr<LLMModel> model;
     Tokenizer tokenizer;
+    std::unique_ptr<LLMModel> draft_model;
+    Tokenizer draft_tokenizer;
+    DraftModelContext draft_ctx{};
     try {
         auto result = load(args.model_dir, args.ane_cache);
         model = std::move(result.first);
         tokenizer = std::move(result.second);
+        if (args.draft_model_dir) {
+            auto draft_result = load(args.draft_model_dir, args.ane_cache);
+            draft_model = std::move(draft_result.first);
+            draft_tokenizer = std::move(draft_result.second);
+            draft_ctx.model = draft_model.get();
+            draft_ctx.tokenizer = &draft_tokenizer;
+        }
     } catch (const std::exception& e) {
         fprintf(stderr, "Error: %s\n", e.what());
         objc_autoreleasePoolPop(pool);
@@ -260,10 +278,11 @@ int main(int argc, char* argv[]) {
     }
 
     int ret;
+    DraftModelContext* draft_ptr = draft_ctx.model ? &draft_ctx : nullptr;
     if (is_chat) {
-        ret = cmd_chat(*model, tokenizer, args);
+        ret = cmd_chat(*model, tokenizer, draft_ptr, args);
     } else {
-        ret = cmd_generate(*model, tokenizer, args);
+        ret = cmd_generate(*model, tokenizer, draft_ptr, args);
     }
 
     objc_autoreleasePoolPop(pool);
