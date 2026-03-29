@@ -3,10 +3,59 @@
 #include <cmath>
 #include <fstream>
 #include <sys/stat.h>
+#include <mutex>
 
 namespace ane_lm {
 
 using json = nlohmann::json;
+
+static bool qwen35_profile_serve_batch() {
+    static bool enabled = getenv("PROFILE_SERVE_BATCH") != nullptr;
+    return enabled;
+}
+
+struct Qwen35BatchProfile {
+    std::mutex mu;
+    uint64_t calls = 0;
+    double rms1_ms = 0.0;
+    double first_proj_ms = 0.0;
+    double core_cpu_ms = 0.0;
+    double oproj_ms = 0.0;
+    double rms2_ms = 0.0;
+    double ffn_ms = 0.0;
+    double final_norm_ms = 0.0;
+    double lm_head_ms = 0.0;
+
+    void add(double rms1, double first_proj, double core_cpu, double oproj, double rms2, double ffn, double final_norm, double lm_head) {
+        std::lock_guard<std::mutex> lock(mu);
+        calls++;
+        rms1_ms += rms1;
+        first_proj_ms += first_proj;
+        core_cpu_ms += core_cpu;
+        oproj_ms += oproj;
+        rms2_ms += rms2;
+        ffn_ms += ffn;
+        final_norm_ms += final_norm;
+        lm_head_ms += lm_head;
+        if (calls % 50 == 0) {
+            double total = rms1_ms + first_proj_ms + core_cpu_ms + oproj_ms + rms2_ms + ffn_ms + final_norm_ms + lm_head_ms;
+            fprintf(stderr,
+                    "Qwen35 forward_batch profile: %llu calls avg %.3f ms [rms1 %.3f | first_proj %.3f | core_cpu %.3f | oproj %.3f | rms2 %.3f | ffn %.3f | final_norm %.3f | lm_head %.3f]\n",
+                    (unsigned long long)calls,
+                    total / calls,
+                    rms1_ms / calls,
+                    first_proj_ms / calls,
+                    core_cpu_ms / calls,
+                    oproj_ms / calls,
+                    rms2_ms / calls,
+                    ffn_ms / calls,
+                    final_norm_ms / calls,
+                    lm_head_ms / calls);
+        }
+    }
+};
+
+static Qwen35BatchProfile g_qwen35_batch_profile;
 
 static int qwen35_prefill_batch_size() {
     static int batch = [] {
@@ -149,20 +198,28 @@ Qwen35Args Qwen35Args::from_json(const json& j) {
 
 // --- Qwen35Model ---
 
+Qwen35Model::Session::~Session() {
+    for (float* ptr : delta_ssm_state) free(ptr);
+    for (float* ptr : delta_conv_state) free(ptr);
+    for (float* ptr : kv_k_cache) free(ptr);
+    for (float* ptr : kv_v_cache) free(ptr);
+    free(x);
+    free(x_norm);
+    free(logits);
+    free(scratch_qkv);
+    free(scratch_conv);
+    free(scratch_y);
+    free(scratch_attn);
+    free(scratch_tmp);
+}
+
 Qwen35Model::~Qwen35Model() {
+    default_session_.reset();
     free(embed_tokens_);
     if (!tie_word_embeddings_) {
         free(lm_head_);
     }
     free(final_norm_);
-    free(x_);
-    free(x_norm_);
-    free(logits_);
-    free(scratch_qkv_);
-    free(scratch_conv_);
-    free(scratch_y_);
-    free(scratch_attn_);
-    free(scratch_tmp_);
     free(rope_cos_);
     free(rope_sin_);
 
@@ -185,33 +242,81 @@ Qwen35Model::~Qwen35Model() {
     }
 
     for (int L = 0; L < num_layers_; L++) {
-        if (layer_types_[L] == LayerType::FullAttention) {
-            free(kv_caches_[L].k_cache);
-            free(kv_caches_[L].v_cache);
-        }
-        if (layer_types_[L] == LayerType::LinearAttention) {
-            free(delta_states_[L].ssm_state);
-            free(delta_states_[L].conv_state);
-        }
         ane_free_layer(&ane_layers_[L]);
     }
 
     free_lm_head_ane();
 }
 
-void Qwen35Model::reset() {
+bool Qwen35Model::init_session(Session& session) const {
+    session.delta_ssm_state.assign(num_layers_, nullptr);
+    session.delta_conv_state.assign(num_layers_, nullptr);
+    session.delta_conv_pos.assign(num_layers_, 0);
+    session.kv_k_cache.assign(num_layers_, nullptr);
+    session.kv_v_cache.assign(num_layers_, nullptr);
+    session.kv_len.assign(num_layers_, 0);
+    session.kv_start.assign(num_layers_, 0);
+
+    session.x = (float*)calloc(hidden_size_, sizeof(float));
+    session.x_norm = (float*)calloc(hidden_size_, sizeof(float));
+    session.logits = (float*)calloc(vocab_size_, sizeof(float));
+    session.scratch_qkv = (float*)calloc(lin_qkv_dim_ + lin_total_val_, sizeof(float));
+    session.scratch_conv = (float*)calloc(lin_qkv_dim_, sizeof(float));
+    session.scratch_y = (float*)calloc(lin_total_val_, sizeof(float));
+    session.scratch_attn = (float*)calloc(full_out_dim_, sizeof(float));
+    session.scratch_tmp = (float*)calloc((size_t)lin_num_val_heads_ * 2 + lin_qkv_dim_, sizeof(float));
+
+    if (!session.x || !session.x_norm || !session.logits || !session.scratch_qkv ||
+        !session.scratch_conv || !session.scratch_y || !session.scratch_attn || !session.scratch_tmp) {
+        return false;
+    }
+
     for (int L = 0; L < num_layers_; L++) {
         if (layer_types_[L] == LayerType::FullAttention) {
-            kv_caches_[L].len = 0;
-            kv_caches_[L].start = 0;
-            memset(kv_caches_[L].k_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
-            memset(kv_caches_[L].v_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
+            session.kv_k_cache[L] = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
+            session.kv_v_cache[L] = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
+            if (!session.kv_k_cache[L] || !session.kv_v_cache[L]) return false;
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
-            memset(delta_states_[L].ssm_state, 0, (size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
-            memset(delta_states_[L].conv_state, 0, (size_t)lin_qkv_dim_ * (conv_kernel_ - 1) * sizeof(float));
-            delta_states_[L].conv_pos = 0;
+            session.delta_ssm_state[L] = (float*)calloc((size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_, sizeof(float));
+            session.delta_conv_state[L] = (float*)calloc((size_t)lin_qkv_dim_ * (conv_kernel_ - 1), sizeof(float));
+            if (!session.delta_ssm_state[L] || !session.delta_conv_state[L]) return false;
         }
+    }
+
+    return true;
+}
+
+std::unique_ptr<Qwen35Model::Session> Qwen35Model::create_session() const {
+    auto session = std::make_unique<Session>();
+    if (!init_session(*session)) {
+        return nullptr;
+    }
+    return session;
+}
+
+void Qwen35Model::reset_session(Session& session) const {
+    for (int L = 0; L < num_layers_; L++) {
+        if (layer_types_[L] == LayerType::FullAttention) {
+            session.kv_len[L] = 0;
+            session.kv_start[L] = 0;
+            memset(session.kv_k_cache[L], 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
+            memset(session.kv_v_cache[L], 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
+        }
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            memset(session.delta_ssm_state[L], 0, (size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
+            memset(session.delta_conv_state[L], 0, (size_t)lin_qkv_dim_ * (conv_kernel_ - 1) * sizeof(float));
+            session.delta_conv_pos[L] = 0;
+        }
+    }
+    memset(session.x, 0, hidden_size_ * sizeof(float));
+    memset(session.x_norm, 0, hidden_size_ * sizeof(float));
+    memset(session.logits, 0, vocab_size_ * sizeof(float));
+}
+
+void Qwen35Model::reset() {
+    if (default_session_) {
+        reset_session(*default_session_);
     }
 }
 
@@ -283,16 +388,6 @@ bool Qwen35Model::load(const std::string& model_dir) {
     // 3. Init ANE
     ane_init();
 
-    // Allocate scratch buffers
-    x_ = (float*)calloc(hidden_size_, sizeof(float));
-    x_norm_ = (float*)calloc(hidden_size_, sizeof(float));
-    logits_ = (float*)calloc(vocab_size_, sizeof(float));
-    scratch_qkv_ = (float*)calloc(lin_qkv_dim_ + lin_total_val_, sizeof(float));
-    scratch_conv_ = (float*)calloc(lin_qkv_dim_, sizeof(float));
-    scratch_y_ = (float*)calloc(lin_total_val_, sizeof(float));
-    scratch_attn_ = (float*)calloc(full_out_dim_, sizeof(float));
-    // scratch_tmp_: a_vec (lin_num_val_heads_) + b_vec (lin_num_val_heads_) + silu_tmp (lin_qkv_dim_)
-    scratch_tmp_ = (float*)calloc((size_t)lin_num_val_heads_ * 2 + lin_qkv_dim_, sizeof(float));
     rope_cos_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
     rope_sin_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
 
@@ -316,26 +411,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
 
     // Initialize layers
     layers_.resize(num_layers_);
-    delta_states_.resize(num_layers_);
-    kv_caches_.resize(num_layers_);
     ane_layers_.resize(num_layers_);
-
-    for (int L = 0; L < num_layers_; L++) {
-        if (layer_types_[L] == LayerType::FullAttention) {
-            auto& kv = kv_caches_[L];
-            kv.k_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
-            kv.v_cache = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
-            kv.len = 0;
-            kv.start = 0;
-            kv.capacity = KV_CACHE_CAPACITY;
-        }
-        if (layer_types_[L] == LayerType::LinearAttention) {
-            auto& ds = delta_states_[L];
-            ds.ssm_state = (float*)calloc((size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_, sizeof(float));
-            ds.conv_state = (float*)calloc((size_t)lin_qkv_dim_ * (conv_kernel_ - 1), sizeof(float));
-            ds.conv_pos = 0;
-        }
-    }
 
     // 4. Load weights + compile ANE kernels
     if (!load_weights(sf.get())) { return false; }
@@ -348,6 +424,13 @@ bool Qwen35Model::load(const std::string& model_dir) {
     }
 
     if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
+
+    default_session_ = create_session();
+    if (!default_session_) {
+        fprintf(stderr, "Failed to allocate default Qwen3.5 session\n");
+        return false;
+    }
+    reset_session(*default_session_);
 
     return true;
 }
@@ -625,11 +708,10 @@ void Qwen35Model::free_lm_head_ane() {
     ane_lm_head_enabled_ = false;
 }
 
-bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
+bool Qwen35Model::forward_deltanet_core(Session& session, int L, float* x, float* pre_oproj) {
     auto& dw = layers_[L].deltanet;
-    auto& st = delta_states_[L];
 
-    float* qkv_z = scratch_qkv_;
+    float* qkv_z = session.scratch_qkv;
     if (!ane_matvec(ane_layers_[L].first_proj, qkv_z, x,
                     hidden_size_, lin_qkv_dim_ + lin_total_val_)) {
         fprintf(stderr, "ANE first_proj eval failed at layer %d (DeltaNet)\n", L);
@@ -639,29 +721,20 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     float* mixed_qkv = qkv_z;
     float* z = qkv_z + lin_qkv_dim_;
 
-    // Small projections on CPU
-    // Note: in_proj_a/b output dim is lin_num_val_heads_
-    float* a_vec = scratch_tmp_;
-    float* b_vec = scratch_tmp_ + lin_num_val_heads_;
+    float* a_vec = session.scratch_tmp;
+    float* b_vec = session.scratch_tmp + lin_num_val_heads_;
     matvec(a_vec, dw.in_proj_a, x, lin_num_val_heads_, hidden_size_);
     matvec(b_vec, dw.in_proj_b, x, lin_num_val_heads_, hidden_size_);
 
-    // Causal conv1d + SiLU
-    float* conv_out = scratch_conv_;
-    conv1d_update(conv_out, st.conv_state, &st.conv_pos, mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-    silu_vec_inplace(conv_out, lin_qkv_dim_, scratch_tmp_ + lin_num_val_heads_ * 2);
+    float* conv_out = session.scratch_conv;
+    conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L], mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+    silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
 
-    // Split into Q, K, V
-    // Q and K have lin_num_heads_ heads, V has lin_num_val_heads_ heads
-    // Each key head corresponds to (lin_num_val_heads_ / lin_num_heads_) value heads
     float* Q = conv_out;
     float* K = conv_out + lin_total_key_;
     float* V = conv_out + lin_total_key_ * 2;
 
-    // Per-head SSM
-    // Architecture: 16 key heads, 32 value heads
-    // Each key head pairs with 2 value heads (val_heads_per_key = 2)
-    float* y = scratch_y_;
+    float* y = session.scratch_y;
     float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
     int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
 
@@ -678,7 +751,7 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
             int vh = kh * val_heads_per_key + vsub;
             float* vh_ptr = V + vh * lin_val_dim_;
             float* yh = y + vh * lin_val_dim_;
-            float* state = st.ssm_state + vh * lin_key_dim_ * lin_val_dim_;
+            float* state = session.delta_ssm_state[L] + vh * lin_key_dim_ * lin_val_dim_;
 
             float beta = sigmoid_f(b_vec[vh]);
             float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
@@ -686,7 +759,6 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
         }
     }
 
-    // RMSNorm gated
     for (int h = 0; h < lin_num_val_heads_; h++) {
         rmsnorm_gated(pre_oproj + h * lin_val_dim_,
                       y + h * lin_val_dim_,
@@ -696,11 +768,10 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     return true;
 }
 
-bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int pos) {
+bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, float* pre_oproj, int pos) {
     auto& fw = layers_[L].full_attn;
-    auto& cache = kv_caches_[L];
 
-    float* qkv_buf = scratch_qkv_;
+    float* qkv_buf = session.scratch_qkv;
     if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x,
                     hidden_size_, full_q_dim_ + full_kv_dim_ * 2)) {
         fprintf(stderr, "ANE first_proj eval failed at layer %d (FullAttn)\n", L);
@@ -711,7 +782,6 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
     float* k_raw = qkv_buf + full_q_dim_;
     float* v_raw = qkv_buf + full_q_dim_ + full_kv_dim_;
 
-    // RMSNorm on Q and K per-head
     for (int h = 0; h < num_q_heads_; h++) {
         float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
         rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
@@ -720,7 +790,6 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
         rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
     }
 
-    // RoPE
     const float* rope_cos_row = nullptr;
     const float* rope_sin_row = nullptr;
     if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
@@ -732,43 +801,50 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
                       head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
                       rope_cos_row, rope_sin_row);
 
-    // KV cache update
     int slot;
-    if (cache.len < cache.capacity) {
-        slot = cache.start + cache.len;
-        if (slot >= cache.capacity) slot -= cache.capacity;
-        cache.len++;
+    if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+        slot = session.kv_start[L] + session.kv_len[L];
+        if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+        session.kv_len[L]++;
     } else {
-        slot = cache.start;
-        cache.start++;
-        if (cache.start >= cache.capacity) cache.start = 0;
+        slot = session.kv_start[L];
+        session.kv_start[L]++;
+        if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
     }
     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
-    memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
-    memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+    memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+    memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
 
-    // GQA attention
-    gqa_attention(pre_oproj, q_gate_raw, cache.k_cache, cache.v_cache,
+    gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
                   num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                  cache.start, cache.len, cache.capacity);
+                  session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
 
-    // Output gate
     if (attn_output_gate_) {
         for (int h = 0; h < num_q_heads_; h++) {
             float* oh = pre_oproj + h * head_dim_;
             const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
-            mul_sigmoid_inplace(oh, gh, head_dim_, scratch_tmp_);
+            mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
         }
     }
     return true;
 }
 
 float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
+    if (!default_session_) return nullptr;
+    return prefill(*default_session_, token_ids, start_pos);
+}
+
+float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
 
     int batch_size = qwen35_prefill_batch_size();
     if (batch_size <= 1 || token_ids.size() == 1) {
-        return LLMModel::prefill(token_ids, start_pos);
+        float* logits = nullptr;
+        for (int i = 0; i < (int)token_ids.size(); i++) {
+            logits = forward(session, token_ids[i], start_pos + i);
+            if (!logits) return nullptr;
+        }
+        return logits;
     }
 
     const int max_proj_dim = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
@@ -819,24 +895,23 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
 
                 if (is_linear) {
                     auto& dw = layers_[L].deltanet;
-                    auto& st = delta_states_[L];
 
                     float* mixed_qkv = proj;
                     float* z = proj + lin_qkv_dim_;
 
-                    float* a_vec = scratch_tmp_;
-                    float* b_vec = scratch_tmp_ + lin_num_val_heads_;
+                    float* a_vec = session.scratch_tmp;
+                    float* b_vec = session.scratch_tmp + lin_num_val_heads_;
                     matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, hidden_size_);
                     matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, hidden_size_);
 
-                    float* conv_out = scratch_conv_;
-                    conv1d_update(conv_out, st.conv_state, &st.conv_pos, mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-                    silu_vec_inplace(conv_out, lin_qkv_dim_, scratch_tmp_ + lin_num_val_heads_ * 2);
+                    float* conv_out = session.scratch_conv;
+                    conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L], mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+                    silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
 
                     float* Q = conv_out;
                     float* K = conv_out + lin_total_key_;
                     float* V = conv_out + lin_total_key_ * 2;
-                    float* y = scratch_y_;
+                    float* y = session.scratch_y;
                     float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
                     int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
 
@@ -853,7 +928,7 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
                             int vh = kh * val_heads_per_key + vsub;
                             float* vh_ptr = V + vh * lin_val_dim_;
                             float* yh = y + vh * lin_val_dim_;
-                            float* state = st.ssm_state + (size_t)vh * lin_key_dim_ * lin_val_dim_;
+                            float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
 
                             float beta = sigmoid_f(b_vec[vh]);
                             float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
@@ -869,7 +944,6 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
                     }
                 } else {
                     auto& fw = layers_[L].full_attn;
-                    auto& cache = kv_caches_[L];
 
                     float* q_gate_raw = proj;
                     float* k_raw = proj + full_q_dim_;
@@ -895,28 +969,28 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
                                       rope_cos_row, rope_sin_row);
 
                     int slot;
-                    if (cache.len < cache.capacity) {
-                        slot = cache.start + cache.len;
-                        if (slot >= cache.capacity) slot -= cache.capacity;
-                        cache.len++;
+                    if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                        slot = session.kv_start[L] + session.kv_len[L];
+                        if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                        session.kv_len[L]++;
                     } else {
-                        slot = cache.start;
-                        cache.start++;
-                        if (cache.start >= cache.capacity) cache.start = 0;
+                        slot = session.kv_start[L];
+                        session.kv_start[L]++;
+                        if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
                     }
                     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
-                    memcpy(cache.k_cache + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
-                    memcpy(cache.v_cache + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+                    memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+                    memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
 
-                    gqa_attention(pre_oproj, q_gate_raw, cache.k_cache, cache.v_cache,
+                    gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
                                   num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                                  cache.start, cache.len, cache.capacity);
+                                  session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
 
                     if (attn_output_gate_) {
                         for (int h = 0; h < num_q_heads_; h++) {
                             float* oh = pre_oproj + h * head_dim_;
                             const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
-                            mul_sigmoid_inplace(oh, gh, head_dim_, scratch_tmp_);
+                            mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
                         }
                     }
                 }
@@ -992,7 +1066,7 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
         last_hidden = x_batch.data() + (size_t)(batch - 1) * hidden_size_;
     }
 
-    rmsnorm(x_, last_hidden, final_norm_, hidden_size_, rms_eps_);
+    rmsnorm(session.x, last_hidden, final_norm_, hidden_size_, rms_eps_);
 
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         bool ok = true;
@@ -1001,7 +1075,7 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
             int offset = c * lm_head_chunk_;
             int rows = vocab_size_ - offset;
             if (rows > lm_head_chunk_) rows = lm_head_chunk_;
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
+            if (!ane_matvec(lm_head_kernels_[c], session.logits + offset, session.x, hidden_size_, rows)) {
                 fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
                 ok = false;
                 break;
@@ -1009,66 +1083,371 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
         }
         if (!ok) {
             free_lm_head_ane();
-            matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+            matvec(session.logits, lm_head_, session.x, vocab_size_, hidden_size_);
         }
     } else {
-        matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+        matvec(session.logits, lm_head_, session.x, vocab_size_, hidden_size_);
     }
 
-    return logits_;
+    return session.logits;
+}
+
+bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch) {
+    if (!sessions || !token_ids || !positions || batch <= 0) return false;
+    if (batch == 1) {
+        return forward(*sessions[0], token_ids[0], positions[0]) != nullptr;
+    }
+    if (batch > ANE_SPATIAL) {
+        for (int base = 0; base < batch; base += ANE_SPATIAL) {
+            int chunk = std::min(ANE_SPATIAL, batch - base);
+            if (!forward_batch(sessions + base, token_ids + base, positions + base, chunk)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const int max_proj_dim = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
+    const int max_attn_dim = std::max(lin_total_val_, full_out_dim_);
+
+    thread_local std::vector<float> x_batch;
+    thread_local std::vector<float> x_norm_batch;
+    thread_local std::vector<float> proj_batch;
+    thread_local std::vector<float> pre_oproj_batch;
+    thread_local std::vector<float> mlp_batch;
+    thread_local std::vector<float> packed0;
+    thread_local std::vector<float> packed1;
+    thread_local std::vector<float> raw_out;
+    thread_local std::vector<float> lm_head_batch;
+
+    x_batch.resize((size_t)batch * hidden_size_);
+    x_norm_batch.resize((size_t)batch * hidden_size_);
+    proj_batch.resize((size_t)batch * max_proj_dim);
+    pre_oproj_batch.resize((size_t)batch * max_attn_dim);
+    mlp_batch.resize((size_t)batch * hidden_size_);
+
+    for (int b = 0; b < batch; b++) {
+        memcpy(x_batch.data() + (size_t)b * hidden_size_,
+               embed_tokens_ + (int64_t)token_ids[b] * hidden_size_,
+               (size_t)hidden_size_ * sizeof(float));
+    }
+
+    double rms1_ms = 0.0;
+    double first_proj_ms = 0.0;
+    double core_cpu_ms = 0.0;
+    double oproj_ms = 0.0;
+    double rms2_ms = 0.0;
+    double ffn_ms = 0.0;
+    double final_norm_ms = 0.0;
+    double lm_head_ms = 0.0;
+    const bool do_profile = qwen35_profile_serve_batch();
+
+    for (int L = 0; L < num_layers_; L++) {
+        Timer t_stage;
+        for (int b = 0; b < batch; b++) {
+            rmsnorm(x_norm_batch.data() + (size_t)b * hidden_size_,
+                    x_batch.data() + (size_t)b * hidden_size_,
+                    layers_[L].input_layernorm, hidden_size_, rms_eps_);
+        }
+        if (do_profile) rms1_ms += t_stage.elapsed_ms();
+
+        const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
+        const int proj_dim = is_linear ? (lin_qkv_dim_ + lin_total_val_) : (full_q_dim_ + 2 * full_kv_dim_);
+        t_stage.reset();
+        if (!ane_matvec_batch(ane_layers_[L].first_proj,
+                              proj_batch.data(), x_norm_batch.data(),
+                              batch, hidden_size_, proj_dim, packed0, raw_out)) {
+            fprintf(stderr, "ANE first_proj batched eval failed at layer %d\n", L);
+            return false;
+        }
+        if (do_profile) first_proj_ms += t_stage.elapsed_ms();
+
+        t_stage.reset();
+        for (int b = 0; b < batch; b++) {
+            Session& session = *sessions[b];
+            float* x_norm = x_norm_batch.data() + (size_t)b * hidden_size_;
+            float* proj = proj_batch.data() + (size_t)b * max_proj_dim;
+            float* pre_oproj = pre_oproj_batch.data() + (size_t)b * max_attn_dim;
+            int pos = positions[b];
+
+            if (is_linear) {
+                auto& dw = layers_[L].deltanet;
+
+                float* mixed_qkv = proj;
+                float* z = proj + lin_qkv_dim_;
+
+                float* a_vec = session.scratch_tmp;
+                float* b_vec = session.scratch_tmp + lin_num_val_heads_;
+                matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, hidden_size_);
+                matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, hidden_size_);
+
+                float* conv_out = session.scratch_conv;
+                conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L], mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
+
+                float* Q = conv_out;
+                float* K = conv_out + lin_total_key_;
+                float* V = conv_out + lin_total_key_ * 2;
+                float* y = session.scratch_y;
+                float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
+                int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+
+                for (int kh = 0; kh < lin_num_heads_; kh++) {
+                    float* qh = Q + kh * lin_key_dim_;
+                    float* kh_ptr = K + kh * lin_key_dim_;
+
+                    l2_normalize(qh, lin_key_dim_);
+                    l2_normalize(kh_ptr, lin_key_dim_);
+                    float qs = q_scale;
+                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
+
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* vh_ptr = V + vh * lin_val_dim_;
+                        float* yh = y + vh * lin_val_dim_;
+                        float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
+
+                        float beta = sigmoid_f(b_vec[vh]);
+                        float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
+                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
+                    }
+                }
+
+                for (int h = 0; h < lin_num_val_heads_; h++) {
+                    rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                                  y + h * lin_val_dim_,
+                                  z + h * lin_val_dim_,
+                                  dw.norm_w, lin_val_dim_);
+                }
+            } else {
+                auto& fw = layers_[L].full_attn;
+
+                float* q_gate_raw = proj;
+                float* k_raw = proj + full_q_dim_;
+                float* v_raw = proj + full_q_dim_ + full_kv_dim_;
+
+                for (int h = 0; h < num_q_heads_; h++) {
+                    float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
+                    rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
+                }
+                for (int h = 0; h < num_kv_heads_; h++) {
+                    rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
+                }
+
+                const float* rope_cos_row = nullptr;
+                const float* rope_sin_row = nullptr;
+                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                    int half_rot = rot_dim_ / 2;
+                    rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+                    rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+                }
+                apply_rope_cached(q_gate_raw, k_raw, num_q_heads_, num_kv_heads_,
+                                  head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
+                                  rope_cos_row, rope_sin_row);
+
+                int slot;
+                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                    slot = session.kv_start[L] + session.kv_len[L];
+                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    session.kv_len[L]++;
+                } else {
+                    slot = session.kv_start[L];
+                    session.kv_start[L]++;
+                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                }
+                size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
+                memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+
+                gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
+                              num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                              session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+
+                if (attn_output_gate_) {
+                    for (int h = 0; h < num_q_heads_; h++) {
+                        float* oh = pre_oproj + h * head_dim_;
+                        const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
+                        mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
+                    }
+                }
+            }
+        }
+        if (do_profile) core_cpu_ms += t_stage.elapsed_ms();
+
+        int attn_dim = is_linear ? lin_total_val_ : full_out_dim_;
+        t_stage.reset();
+        if (ane_layers_[L].oproj_add) {
+            if (!ane_binary_batch(ane_layers_[L].oproj_add,
+                                  attn_dim, hidden_size_, hidden_size_,
+                                  x_batch.data(),
+                                  pre_oproj_batch.data(), x_batch.data(), batch,
+                                  packed0, packed1, raw_out)) {
+                fprintf(stderr, "ANE oproj_add batched eval failed at layer %d\n", L);
+                return false;
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                float* x = x_batch.data() + (size_t)b * hidden_size_;
+                float* pre_oproj = pre_oproj_batch.data() + (size_t)b * max_attn_dim;
+                float* attn_out = mlp_batch.data() + (size_t)b * hidden_size_;
+                if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
+                    fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
+                    return false;
+                }
+                for (int i = 0; i < hidden_size_; i++) x[i] += attn_out[i];
+            }
+        }
+        if (do_profile) oproj_ms += t_stage.elapsed_ms();
+
+        t_stage.reset();
+        for (int b = 0; b < batch; b++) {
+            rmsnorm(x_norm_batch.data() + (size_t)b * hidden_size_,
+                    x_batch.data() + (size_t)b * hidden_size_,
+                    layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+        }
+        if (do_profile) rms2_ms += t_stage.elapsed_ms();
+
+        t_stage.reset();
+        if (ane_layers_[L].ffn_resadd) {
+            if (!ane_binary_batch(ane_layers_[L].ffn_resadd,
+                                  hidden_size_, hidden_size_, hidden_size_,
+                                  x_batch.data(),
+                                  x_norm_batch.data(), x_batch.data(), batch,
+                                  packed0, packed1, raw_out)) {
+                fprintf(stderr, "ANE ffn_resadd batched eval failed at layer %d\n", L);
+                return false;
+            }
+        } else if (ane_layers_[L].fused_ffn) {
+            if (!ane_matvec_batch(ane_layers_[L].fused_ffn,
+                                  mlp_batch.data(), x_norm_batch.data(),
+                                  batch, hidden_size_, hidden_size_, packed0, raw_out)) {
+                fprintf(stderr, "ANE fused_ffn batched eval failed at layer %d\n", L);
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                float* x = x_batch.data() + (size_t)b * hidden_size_;
+                float* mlp = mlp_batch.data() + (size_t)b * hidden_size_;
+                for (int i = 0; i < hidden_size_; i++) x[i] += mlp[i];
+            }
+        } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
+            for (int b = 0; b < batch; b++) {
+                float* x = x_batch.data() + (size_t)b * hidden_size_;
+                float* x_norm = x_norm_batch.data() + (size_t)b * hidden_size_;
+                float* mlp = mlp_batch.data() + (size_t)b * hidden_size_;
+                if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp, x_norm)) {
+                    fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+                    return false;
+                }
+                for (int i = 0; i < hidden_size_; i++) x[i] += mlp[i];
+            }
+        } else {
+            fprintf(stderr, "No FFN kernel for layer %d\n", L);
+            return false;
+        }
+        if (do_profile) ffn_ms += t_stage.elapsed_ms();
+    }
+
+    Timer t_stage;
+    for (int b = 0; b < batch; b++) {
+        rmsnorm(x_norm_batch.data() + (size_t)b * hidden_size_,
+                x_batch.data() + (size_t)b * hidden_size_,
+                final_norm_, hidden_size_, rms_eps_);
+        memcpy(sessions[b]->x, x_norm_batch.data() + (size_t)b * hidden_size_,
+               (size_t)hidden_size_ * sizeof(float));
+    }
+    if (do_profile) final_norm_ms += t_stage.elapsed_ms();
+
+    t_stage.reset();
+    if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
+        bool ok = true;
+        int chunks = (int)lm_head_kernels_.size();
+        for (int c = 0; c < chunks; c++) {
+            int offset = c * lm_head_chunk_;
+            int rows = vocab_size_ - offset;
+            if (rows > lm_head_chunk_) rows = lm_head_chunk_;
+            lm_head_batch.resize((size_t)batch * rows);
+            if (!ane_matvec_batch(lm_head_kernels_[c],
+                                  lm_head_batch.data(), x_norm_batch.data(),
+                                  batch, hidden_size_, rows, packed0, raw_out)) {
+                fprintf(stderr, "ANE LM head batched eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
+                ok = false;
+                break;
+            }
+            for (int b = 0; b < batch; b++) {
+                memcpy(sessions[b]->logits + offset,
+                       lm_head_batch.data() + (size_t)b * rows,
+                       (size_t)rows * sizeof(float));
+            }
+        }
+        if (!ok) {
+            free_lm_head_ane();
+            for (int b = 0; b < batch; b++) {
+                matvec(sessions[b]->logits, lm_head_, x_norm_batch.data() + (size_t)b * hidden_size_, vocab_size_, hidden_size_);
+            }
+        }
+    } else {
+        for (int b = 0; b < batch; b++) {
+            matvec(sessions[b]->logits, lm_head_, x_norm_batch.data() + (size_t)b * hidden_size_, vocab_size_, hidden_size_);
+        }
+    }
+    if (do_profile) {
+        lm_head_ms += t_stage.elapsed_ms();
+        g_qwen35_batch_profile.add(rms1_ms, first_proj_ms, core_cpu_ms, oproj_ms, rms2_ms, ffn_ms, final_norm_ms, lm_head_ms);
+    }
+
+    return true;
 }
 
 float* Qwen35Model::forward(int token, int pos) {
-    // Embedding lookup
-    memcpy(x_, embed_tokens_ + (int64_t)token * hidden_size_, hidden_size_ * sizeof(float));
+    if (!default_session_) return nullptr;
+    return forward(*default_session_, token, pos);
+}
 
-    float* pre_oproj = scratch_attn_;
+float* Qwen35Model::forward(Session& session, int token, int pos) {
+    memcpy(session.x, embed_tokens_ + (int64_t)token * hidden_size_, hidden_size_ * sizeof(float));
+
+    float* pre_oproj = session.scratch_attn;
 
     for (int L = 0; L < num_layers_; L++) {
-        // Pre-attention norm
-        rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
+        rmsnorm(session.x_norm, session.x, layers_[L].input_layernorm, hidden_size_, rms_eps_);
 
-        // Attention core
         if (layer_types_[L] == LayerType::LinearAttention) {
-            if (!forward_deltanet_core(L, x_norm_, pre_oproj)) return nullptr;
+            if (!forward_deltanet_core(session, L, session.x_norm, pre_oproj)) return nullptr;
         } else {
-            if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) return nullptr;
+            if (!forward_full_attn_core(session, L, session.x_norm, pre_oproj, pos)) return nullptr;
         }
 
-        // O projection + residual add (ANE)
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
         if (ane_layers_[L].oproj_add) {
-            if (!ane_eval_oproj_add(ane_layers_[L].oproj_add, x_, pre_oproj, x_, attn_dim, hidden_size_)) {
+            if (!ane_eval_oproj_add(ane_layers_[L].oproj_add, session.x, pre_oproj, session.x, attn_dim, hidden_size_)) {
                 fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
                 return nullptr;
             }
         } else {
-            float* attn_out = x_norm_;
+            float* attn_out = session.x_norm;
             if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
                 fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
                 return nullptr;
             }
-            for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
+            for (int i = 0; i < hidden_size_; i++) session.x[i] += attn_out[i];
         }
 
-        // Post-attention norm
-        rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+        rmsnorm(session.x_norm, session.x, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
-        // FFN (ANE) — fused residual, fused plain, or chunked
         if (ane_layers_[L].ffn_resadd) {
-            if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, x_, x_norm_, x_, hidden_size_)) {
+            if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, session.x, session.x_norm, session.x, hidden_size_)) {
                 fprintf(stderr, "ANE ffn_resadd eval failed at layer %d\n", L);
                 return nullptr;
             }
         } else {
-            float* mlp_out = scratch_attn_;
+            float* mlp_out = session.scratch_attn;
             if (ane_layers_[L].fused_ffn) {
-                if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+                if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, session.x_norm, hidden_size_, hidden_size_)) {
                     fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
                     return nullptr;
                 }
             } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
-                if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
+                if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, session.x_norm)) {
                     fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
                     return nullptr;
                 }
@@ -1077,14 +1456,12 @@ float* Qwen35Model::forward(int token, int pos) {
                 return nullptr;
             }
 
-            for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+            for (int i = 0; i < hidden_size_; i++) session.x[i] += mlp_out[i];
         }
     }
 
-    // Final norm
-    rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
+    rmsnorm(session.x, session.x, final_norm_, hidden_size_, rms_eps_);
 
-    // LM head
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         bool ok = true;
         int chunks = (int)lm_head_kernels_.size();
@@ -1092,7 +1469,7 @@ float* Qwen35Model::forward(int token, int pos) {
             int offset = c * lm_head_chunk_;
             int rows = vocab_size_ - offset;
             if (rows > lm_head_chunk_) rows = lm_head_chunk_;
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
+            if (!ane_matvec(lm_head_kernels_[c], session.logits + offset, session.x, hidden_size_, rows)) {
                 fprintf(stderr, "ANE LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
                 ok = false;
                 break;
@@ -1100,13 +1477,13 @@ float* Qwen35Model::forward(int token, int pos) {
         }
         if (!ok) {
             free_lm_head_ane();
-            matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+            matvec(session.logits, lm_head_, session.x, vocab_size_, hidden_size_);
         }
     } else {
-        matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
+        matvec(session.logits, lm_head_, session.x, vocab_size_, hidden_size_);
     }
 
-    return logits_;
+    return session.logits;
 }
 
 } // namespace ane_lm

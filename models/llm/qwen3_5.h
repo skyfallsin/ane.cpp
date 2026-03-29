@@ -118,10 +118,40 @@ struct Qwen35Args {
 // Qwen3.5 model implementation
 class Qwen35Model : public LLMModel {
 public:
+    struct Session {
+        std::vector<float*> delta_ssm_state;
+        std::vector<float*> delta_conv_state;
+        std::vector<int> delta_conv_pos;
+        std::vector<float*> kv_k_cache;
+        std::vector<float*> kv_v_cache;
+        std::vector<int> kv_len;
+        std::vector<int> kv_start;
+        float* x = nullptr;
+        float* x_norm = nullptr;
+        float* logits = nullptr;
+        float* scratch_qkv = nullptr;
+        float* scratch_conv = nullptr;
+        float* scratch_y = nullptr;
+        float* scratch_attn = nullptr;
+        float* scratch_tmp = nullptr;
+
+        Session() = default;
+        Session(const Session&) = delete;
+        Session& operator=(const Session&) = delete;
+        Session(Session&&) = delete;
+        Session& operator=(Session&&) = delete;
+        ~Session();
+    };
+
     ~Qwen35Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
     float* prefill(const std::vector<int>& token_ids, int start_pos = 0) override;
+    float* forward(Session& session, int token_id, int pos);
+    bool forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch);
+    float* prefill(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
+    std::unique_ptr<Session> create_session() const;
+    void reset_session(Session& session) const;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
 
@@ -153,7 +183,7 @@ private:
 
     static constexpr int MAX_SEQ_LEN = 4096;
     static constexpr int KV_CACHE_CAPACITY = 2048;
-    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 32768;
+    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 65536;
 
     std::vector<LayerType> layer_types_;
 
@@ -182,30 +212,12 @@ private:
         float* post_attention_layernorm = nullptr;
     };
 
-    // DeltaNet state
-    struct DeltaNetState {
-        float* ssm_state = nullptr;
-        float* conv_state = nullptr;
-        int conv_pos = 0;
-    };
-
-    // KV cache
-    struct KVCache {
-        float* k_cache = nullptr;
-        float* v_cache = nullptr;
-        int len = 0;
-        int start = 0;
-        int capacity = 0;
-    };
-
     // Model data
     std::vector<LayerWeights> layers_;
     float* embed_tokens_ = nullptr;
     float* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
 
-    std::vector<DeltaNetState> delta_states_;
-    std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
 
     // LM head ANE kernels
@@ -213,26 +225,19 @@ private:
     int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
     bool ane_lm_head_enabled_ = false;
 
-    // Scratch buffers
-    float* x_ = nullptr;
-    float* x_norm_ = nullptr;
-    float* logits_ = nullptr;
-    float* scratch_qkv_ = nullptr;
-    float* scratch_conv_ = nullptr;
-    float* scratch_y_ = nullptr;
-    float* scratch_attn_ = nullptr;
-    float* scratch_tmp_ = nullptr;
+    std::unique_ptr<Session> default_session_;
     float* rope_cos_ = nullptr;
     float* rope_sin_ = nullptr;
 
+    bool init_session(Session& session) const;
     void apply_args(const Qwen35Args& args);
     bool load_weights(ModelWeights* sf);
     bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
     bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
     void free_lm_head_ane();
 
-    bool forward_deltanet_core(int L, float* x, float* pre_oproj);
-    bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
+    bool forward_deltanet_core(Session& session, int L, float* x, float* pre_oproj);
+    bool forward_full_attn_core(Session& session, int L, float* x, float* pre_oproj, int pos);
 };
 
 } // namespace ane_lm
