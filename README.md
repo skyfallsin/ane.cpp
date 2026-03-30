@@ -33,6 +33,10 @@ Shared-process serve mode on **Qwen3.5-4B** reached:
 
 These numbers come from the companion field guide's current measurements and should be treated as hardware- and setup-specific rather than general benchmarks.
 
+Single-stream tok/s on current M3 Max hardware is still modest. The reason this path is interesting is not just foreground chat speed: if ANE inference can handle useful work at low energy cost, and if one warm process can absorb multiple low-rate requests concurrently, it becomes a plausible building block for background or always-on workloads. That is why this repo tracks both shared-process concurrency and relative energy use, not just peak tok/s.
+
+For relative power / tokens-per-joule measurements, see `scripts/energy_benchmark.sh`.
+
 ## Supported models
 
 - **Qwen3** (dense) — tested up to 4B parameters
@@ -58,7 +62,23 @@ cmake --build build
 ./build/ane.cpp convert --model /path/to/Qwen3-4B
 ```
 
-Download models in safetensors format from HuggingFace, for example `Qwen/Qwen3-4B` or `Qwen/Qwen3.5-4B`.
+Download one of the supported safetensors model directories from HuggingFace and pass that directory to `--model`.
+
+If you do not already have the Hugging Face CLI installed:
+
+```bash
+python3 -m pip install "huggingface_hub[cli]"
+```
+
+If you want faster downloads, Hugging Face also supports transfer acceleration via `hf_transfer`:
+
+```bash
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download Qwen/Qwen3-4B --local-dir Qwen3-4B
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download Qwen/Qwen3.5-4B --local-dir Qwen3.5-4B
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download Qwen/Qwen3.5-9B --local-dir Qwen3.5-9B
+```
+
+These commands create local model directories such as `./Qwen3-4B`, which can then be used directly with `--model ./Qwen3-4B`.
 
 ### Options
 
@@ -125,6 +145,8 @@ latency ≈ 119µs + bytes / 78 GB/s
 ```
 
 That model has been more useful than treating the remaining overhead as a single opaque dispatch cost.
+
+The practical implication is that future gains may matter most in aggregate-throughput and background-work settings. If newer ANE generations improve bandwidth, compiler behavior, or multi-program runtime limits, the same batching structure that already helps at 2–4 concurrent requests on M3 Max could become more useful than the current single-stream tok/s alone suggests.
 
 ## ANE findings that shape the runtime
 
