@@ -1,4 +1,4 @@
-// main.cpp — ane-lm: Apple Neural Engine LLM inference tool
+// main.cpp — ane.cpp: Apple Neural Engine LLM inference tool
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -242,7 +242,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
         return 1;
     }
 
-    fprintf(stderr, "ane-lm serve listening on 127.0.0.1:%d with %d sessions\n", args.port, args.sessions);
+    fprintf(stderr, "ane.cpp serve listening on 127.0.0.1:%d with %d sessions\n", args.port, args.sessions);
 
     std::thread scheduler([&] {
         while (true) {
@@ -587,7 +587,7 @@ int main(int argc, char* argv[]) {
         return ret;
     }
 
-    LOG("=== ane-lm: Apple Neural Engine LLM Inference ===\n");
+    LOG("=== ane.cpp: Apple Neural Engine LLM Inference ===\n");
     LOG("Model: %s\n", args.model_dir);
     if (args.draft_model_dir) LOG("Draft model: %s\n", args.draft_model_dir);
     LOG("Mode: %s\n", is_chat ? "chat" : (is_serve ? "serve" : "generate"));

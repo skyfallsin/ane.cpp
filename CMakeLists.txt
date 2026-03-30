@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ane-lm VERSION 0.1.0 LANGUAGES C CXX)
+project(ane.cpp VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,15 +63,17 @@ set(MAIN_SOURCE
 )
 
 # Executable
-add_executable(ane-lm
+add_executable(ane_cpp
     ${VENDOR_SOURCES}
     ${CORE_SOURCES}
     ${MODEL_SOURCES}
     ${MAIN_SOURCE}
 )
 
+set_target_properties(ane_cpp PROPERTIES OUTPUT_NAME "ane.cpp")
+
 # Link frameworks and ObjC runtime
-target_link_libraries(ane-lm PRIVATE
+target_link_libraries(ane_cpp PRIVATE
     nlohmann_json::nlohmann_json
     tokenizers_cpp
     "-framework Foundation"
@@ -81,7 +83,7 @@ target_link_libraries(ane-lm PRIVATE
 )
 
 # Optimization for release
-target_compile_options(ane-lm PRIVATE
+target_compile_options(ane_cpp PRIVATE
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:RelWithDebInfo>:-O2 -g>
 )

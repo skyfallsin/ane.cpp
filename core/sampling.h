@@ -5,10 +5,13 @@
 namespace ane_lm {
 
 struct SamplingParams {
-    float temperature = 0.6f;
-    float repetition_penalty = 1.2f;
+    float temperature = 0.7f;
+    float repetition_penalty = 1.0f;
     int repetition_context_size = 256;
-    float frequency_penalty = 0.1f;
+    float frequency_penalty = 0.0f;
+    float presence_penalty = 1.5f;
+    int top_k = 20;
+    float top_p = 0.8f;
 };
 
 void compute_sampling_probs(float* probs_out, const float* logits, int vocab_size,

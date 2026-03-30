@@ -33,7 +33,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", action="append", default=[], help="Prompt to use (repeatable)")
     p.add_argument("--prompts-file", help="Text file with one prompt per line")
     p.add_argument("--prefill-batch", type=int, help="Set ANE_PREFILL_BATCH for child processes")
-    p.add_argument("--binary", default="./build/ane-lm", help="Path to ane-lm binary")
+    p.add_argument("--binary", default="./build/ane.cpp", help="Path to ane.cpp binary")
+    p.add_argument("--server-host", default="127.0.0.1", help="Use ane.cpp serve mode at this host")
+    p.add_argument("--server-port", type=int, help="Use ane.cpp serve mode at this port")
     p.add_argument("--json-out", help="Write full results JSON to this file")
     p.add_argument("--verbose-errors", action="store_true")
     return p.parse_args()
@@ -62,45 +64,80 @@ def parse_metrics(stderr_text: str) -> dict:
 
 
 async def run_one(index: int, prompt: str, args: argparse.Namespace, sem: asyncio.Semaphore, env: dict) -> dict:
-    cmd = [
-        args.binary,
-        "generate",
-        "--model",
-        args.model,
-        "--prompt",
-        prompt,
-        "--max-tokens",
-        str(args.max_tokens),
-        "--temp",
-        str(args.temp),
-        "--repeat-penalty",
-        str(args.repeat_penalty),
-    ]
-
     async with sem:
         start = time.perf_counter()
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout_b, stderr_b = await proc.communicate()
-        end = time.perf_counter()
+        if args.server_port:
+            reader, writer = await asyncio.open_connection(args.server_host, args.server_port)
+            payload = {
+                "id": index,
+                "prompt": prompt,
+                "max_tokens": args.max_tokens,
+                "temp": args.temp,
+                "repeat_penalty": args.repeat_penalty,
+            }
+            writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await writer.drain()
+            response_line = await reader.readline()
+            end = time.perf_counter()
+            writer.close()
+            await writer.wait_closed()
 
-    stdout = stdout_b.decode("utf-8", errors="replace")
-    stderr = stderr_b.decode("utf-8", errors="replace")
-    metrics = parse_metrics(stderr)
-    result = {
-        "index": index,
-        "ok": proc.returncode == 0 and metrics["generation_tps"] is not None,
-        "returncode": proc.returncode,
-        "wall_seconds": end - start,
-        "prompt": prompt,
-        "stdout": stdout,
-        "stderr": stderr,
-        **metrics,
-    }
+            stdout = ""
+            stderr = response_line.decode("utf-8", errors="replace")
+            response = json.loads(stderr) if stderr.strip() else {}
+            metrics = {
+                "prompt_tokens": response.get("prompt_tokens"),
+                "prompt_tps": response.get("prompt_tps"),
+                "generation_tokens": response.get("generation_tokens"),
+                "generation_tps": response.get("generation_tps"),
+            }
+            result = {
+                "index": index,
+                "ok": bool(response.get("ok")) and metrics["generation_tps"] is not None,
+                "returncode": 0 if response.get("ok") else 1,
+                "wall_seconds": end - start,
+                "prompt": prompt,
+                "stdout": stdout,
+                "stderr": stderr,
+                **metrics,
+            }
+        else:
+            cmd = [
+                args.binary,
+                "generate",
+                "--model",
+                args.model,
+                "--prompt",
+                prompt,
+                "--max-tokens",
+                str(args.max_tokens),
+                "--temp",
+                str(args.temp),
+                "--repeat-penalty",
+                str(args.repeat_penalty),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_b, stderr_b = await proc.communicate()
+            end = time.perf_counter()
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            metrics = parse_metrics(stderr)
+            result = {
+                "index": index,
+                "ok": proc.returncode == 0 and metrics["generation_tps"] is not None,
+                "returncode": proc.returncode,
+                "wall_seconds": end - start,
+                "prompt": prompt,
+                "stdout": stdout,
+                "stderr": stderr,
+                **metrics,
+            }
     status = "ok" if result["ok"] else "fail"
     prompt_tps = "-" if metrics["prompt_tps"] is None else f"{metrics['prompt_tps']:.3f}"
     gen_tps = "-" if metrics["generation_tps"] is None else f"{metrics['generation_tps']:.3f}"
@@ -122,9 +159,10 @@ async def main_async() -> int:
     if args.concurrency < 1:
         raise SystemExit("--concurrency must be >= 1")
 
-    binary_path = Path(args.binary)
-    if not binary_path.exists():
-        raise SystemExit(f"binary not found: {binary_path}")
+    if not args.server_port:
+        binary_path = Path(args.binary)
+        if not binary_path.exists():
+            raise SystemExit(f"binary not found: {binary_path}")
     model_path = Path(args.model)
     if not model_path.exists():
         raise SystemExit(f"model not found: {model_path}")
@@ -197,6 +235,8 @@ async def main_async() -> int:
                 "repeat_penalty": args.repeat_penalty,
                 "prefill_batch": args.prefill_batch,
                 "binary": args.binary,
+                "server_host": args.server_host,
+                "server_port": args.server_port,
             },
             "results": results,
         }
