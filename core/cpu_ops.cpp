@@ -1,5 +1,6 @@
 #include "cpu_ops.h"
 #include <alloca.h>
+#include <cstdlib>
 
 namespace ane_lm {
 
@@ -132,19 +133,51 @@ void conv1d_update(float* y, float* conv_state, int* state_pos, const float* x,
 
 void ssm_step(float* y, float* state, const float* q, const float* k,
               const float* v, float decay, float beta, int key_dim, int value_dim) {
+    static bool use_fused = getenv("ANE_SSM_OLD") == nullptr;
+    if (!use_fused) {
+        float* Sk = (float*)alloca(value_dim * sizeof(float));
+        cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
+                    state, value_dim, k, 1, 0.0f, Sk, 1);
+
+        float* delta = (float*)alloca(value_dim * sizeof(float));
+        vDSP_vsub(Sk, 1, v, 1, delta, 1, (vDSP_Length)value_dim);
+
+        cblas_sscal(key_dim * value_dim, decay, state, 1);
+        cblas_sger(CblasRowMajor, key_dim, value_dim, beta,
+                   k, 1, delta, 1, state, value_dim);
+
+        cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
+                    state, value_dim, q, 1, 0.0f, y, 1);
+        return;
+    }
+
     float* Sk = (float*)alloca(value_dim * sizeof(float));
-    cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
-                state, value_dim, k, 1, 0.0f, Sk, 1);
-
     float* delta = (float*)alloca(value_dim * sizeof(float));
-    vDSP_vsub(Sk, 1, v, 1, delta, 1, (vDSP_Length)value_dim);
+    memset(Sk, 0, (size_t)value_dim * sizeof(float));
 
-    cblas_sscal(key_dim * value_dim, decay, state, 1);
-    cblas_sger(CblasRowMajor, key_dim, value_dim, beta,
-               k, 1, delta, 1, state, value_dim);
+    for (int i = 0; i < key_dim; i++) {
+        const float ki = k[i];
+        const float* row = state + (size_t)i * value_dim;
+        for (int j = 0; j < value_dim; j++) {
+            Sk[j] += row[j] * ki;
+        }
+    }
 
-    cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
-                state, value_dim, q, 1, 0.0f, y, 1);
+    for (int j = 0; j < value_dim; j++) {
+        delta[j] = v[j] - Sk[j];
+        y[j] = 0.0f;
+    }
+
+    for (int i = 0; i < key_dim; i++) {
+        const float q_i = q[i];
+        const float beta_k_i = beta * k[i];
+        float* row = state + (size_t)i * value_dim;
+        for (int j = 0; j < value_dim; j++) {
+            const float updated = row[j] * decay + beta_k_i * delta[j];
+            row[j] = updated;
+            y[j] += updated * q_i;
+        }
+    }
 }
 
 void gqa_attention(float* out, const float* q,
