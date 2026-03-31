@@ -68,6 +68,42 @@ static int qwen35_prefill_batch_size() {
     return batch;
 }
 
+static bool qwen35_use_merged_ffn_gu() {
+    static bool enabled = getenv("ANE_FFN_MERGED_GU") != nullptr;
+    return enabled;
+}
+
+static bool qwen35_linear_z_on_cpu() {
+    static bool enabled = getenv("ANE_LINEAR_Z_ON_CPU") != nullptr;
+    return enabled;
+}
+
+static bool qwen35_batch_rmsgate() {
+    static bool enabled = getenv("ANE_BATCH_RMSGATE") != nullptr;
+    return enabled;
+}
+
+static void rmsnorm_gated_repeated(float* out,
+                                   const float* x,
+                                   const float* z,
+                                   const float* weight,
+                                   int heads,
+                                   int dim,
+                                   float* tmp) {
+    for (int h = 0; h < heads; h++) {
+        float* out_h = out + (size_t)h * dim;
+        const float* x_h = x + (size_t)h * dim;
+        const float* z_h = z + (size_t)h * dim;
+        float ss = 0.0f;
+        vDSP_svesq(x_h, 1, &ss, (vDSP_Length)dim);
+        ss = 1.0f / sqrtf(ss / dim + 1e-6f);
+        vDSP_vsmul(x_h, 1, &ss, out_h, 1, (vDSP_Length)dim);
+        vDSP_vmul(out_h, 1, weight, 1, out_h, 1, (vDSP_Length)dim);
+        mul_sigmoid_inplace(out_h, z_h, dim, tmp);
+        vDSP_vmul(out_h, 1, z_h, 1, out_h, 1, (vDSP_Length)dim);
+    }
+}
+
 static void pack_w_lanes(std::vector<float>& packed,
                          const float* batch_data,
                          int batch,
@@ -231,6 +267,7 @@ Qwen35Model::~Qwen35Model() {
         if (lw.type == LayerType::LinearAttention) {
             free(lw.deltanet.in_proj_a);
             free(lw.deltanet.in_proj_b);
+            free(lw.deltanet.in_proj_z);
             free(lw.deltanet.conv1d_w);
             free(lw.deltanet.A);
             free(lw.deltanet.dt_bias);
@@ -474,6 +511,9 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
             dw.in_proj_b = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            dw.in_proj_z = sf->load_bf16_to_f32(name, (int64_t)lin_total_val_ * hidden_size_);
+
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.conv1d.weight", L);
             dw.conv1d_w = sf->load_bf16_to_f32(name, (int64_t)lin_qkv_dim_ * conv_kernel_);
 
@@ -489,7 +529,7 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.norm.weight", L);
             dw.norm_w = sf->load_f32_direct(name, lin_val_dim_);
 
-            if (!dw.in_proj_a || !dw.in_proj_b || !dw.conv1d_w ||
+            if (!dw.in_proj_a || !dw.in_proj_b || !dw.in_proj_z || !dw.conv1d_w ||
                 !dw.A || !dw.dt_bias || !dw.norm_w) {
                 fprintf(stderr, "Failed to load DeltaNet weights for layer %d\n", L);
                 return false;
@@ -510,7 +550,61 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
         }
     }
 
-    LOG("All weights loaded successfully\n");
+    // Load CPU float32 weight copies for GEMM-based prefill
+    cpu_weights_.resize(num_layers_);
+    for (int L = 0; L < num_layers_; L++) {
+        auto& cw = cpu_weights_[L];
+        char n1[256], n2[256], n3[256];
+
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
+            cw.first_proj = sf->load_bf16_to_f32(n1, (int64_t)lin_qkv_dim_ * hidden_size_);
+            cw.first_proj_rows = lin_qkv_dim_;
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            cw.first_proj_b = sf->load_bf16_to_f32(n1, (int64_t)lin_total_val_ * hidden_size_);
+            cw.first_proj_b_rows = lin_total_val_;
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            cw.o_proj = sf->load_bf16_to_f32(n1, (int64_t)hidden_size_ * lin_total_val_);
+            cw.o_proj_in = lin_total_val_;
+        } else {
+            // Full attention: load q/k/v separately and concatenate
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(n2, sizeof(n2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(n3, sizeof(n3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
+            int proj_rows = full_q_dim_ + 2 * full_kv_dim_;
+            cw.first_proj = (float*)calloc((size_t)proj_rows * hidden_size_, sizeof(float));
+            float* q_w = sf->load_bf16_to_f32(n1, (int64_t)full_q_dim_ * hidden_size_);
+            float* k_w = sf->load_bf16_to_f32(n2, (int64_t)full_kv_dim_ * hidden_size_);
+            float* v_w = sf->load_bf16_to_f32(n3, (int64_t)full_kv_dim_ * hidden_size_);
+            if (q_w && k_w && v_w && cw.first_proj) {
+                memcpy(cw.first_proj, q_w, (size_t)full_q_dim_ * hidden_size_ * sizeof(float));
+                memcpy(cw.first_proj + (size_t)full_q_dim_ * hidden_size_, k_w, (size_t)full_kv_dim_ * hidden_size_ * sizeof(float));
+                memcpy(cw.first_proj + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, v_w, (size_t)full_kv_dim_ * hidden_size_ * sizeof(float));
+            }
+            free(q_w); free(k_w); free(v_w);
+            cw.first_proj_rows = proj_rows;
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            cw.o_proj = sf->load_bf16_to_f32(n1, (int64_t)hidden_size_ * full_out_dim_);
+            cw.o_proj_in = full_out_dim_;
+        }
+
+        snprintf(n1, sizeof(n1), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(n2, sizeof(n2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+        snprintf(n3, sizeof(n3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+        cw.gate_proj = sf->load_bf16_to_f32(n1, (int64_t)intermediate_size_ * hidden_size_);
+        cw.up_proj = sf->load_bf16_to_f32(n2, (int64_t)intermediate_size_ * hidden_size_);
+        cw.down_proj = sf->load_bf16_to_f32(n3, (int64_t)hidden_size_ * intermediate_size_);
+
+        if (!cw.first_proj || !cw.o_proj || !cw.gate_proj || !cw.up_proj || !cw.down_proj) {
+            fprintf(stderr, "Warning: failed to load CPU weights for layer %d, CPU prefill unavailable\n", L);
+        }
+    }
+    cpu_lm_head_ = lm_head_;  // already f32 from load_bf16_to_f32 above
+
+    LOG("All weights loaded successfully (including CPU prefill copies)\n");
     return true;
 }
 
@@ -542,7 +636,10 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
             snprintf(name2, sizeof(name2), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
 
-            if (use_blobs) {
+            if (qwen35_linear_z_on_cpu()) {
+                ane_layers_[L].first_proj = ane_compile_matmul(
+                    sf->get_bf16_ptr(name), lin_qkv_dim_, hidden_size_);
+            } else if (use_blobs) {
                 ane_layers_[L].first_proj = ane_compile_fused_2_blob(
                     blob_path(blob_dir, name), lin_qkv_dim_,
                     blob_path(blob_dir, name2), lin_total_val_, hidden_size_);
@@ -601,7 +698,11 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         int ffn_chunks = ane_ffn_chunk_count(hidden_size_, intermediate_size_);
         if (ffn_chunks <= 1) {
             // Try fused FFN + residual add first
-            if (use_blobs) {
+            if (qwen35_use_merged_ffn_gu()) {
+                ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd_merged_gu(
+                    sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
+                    sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+            } else if (use_blobs) {
                 ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd_blob(
                     blob_path(blob_dir, name), blob_path(blob_dir, name2),
                     blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
@@ -611,7 +712,11 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
                     sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
             }
             if (!ane_layers_[L].ffn_resadd) {
-                if (use_blobs) {
+                if (qwen35_use_merged_ffn_gu()) {
+                    ane_layers_[L].fused_ffn = ane_compile_fused_ffn_merged_gu(
+                        sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
+                        sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+                } else if (use_blobs) {
                     ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
                         blob_path(blob_dir, name), blob_path(blob_dir, name2),
                         blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
@@ -708,18 +813,29 @@ void Qwen35Model::free_lm_head_ane() {
     ane_lm_head_enabled_ = false;
 }
 
-bool Qwen35Model::forward_deltanet_core(Session& session, int L, float* x, float* pre_oproj) {
+bool Qwen35Model::forward_deltanet_core(Session& session, int L, float* x, float* pre_oproj, double* out_ane_ms) {
     auto& dw = layers_[L].deltanet;
 
     float* qkv_z = session.scratch_qkv;
-    if (!ane_matvec(ane_layers_[L].first_proj, qkv_z, x,
-                    hidden_size_, lin_qkv_dim_ + lin_total_val_)) {
-        fprintf(stderr, "ANE first_proj eval failed at layer %d (DeltaNet)\n", L);
-        return false;
-    }
-
     float* mixed_qkv = qkv_z;
     float* z = qkv_z + lin_qkv_dim_;
+    Timer t_ane;
+    if (qwen35_linear_z_on_cpu()) {
+        if (!ane_matvec(ane_layers_[L].first_proj, mixed_qkv, x,
+                        hidden_size_, lin_qkv_dim_)) {
+            fprintf(stderr, "ANE first_proj eval failed at layer %d (DeltaNet qkv)\n", L);
+            return false;
+        }
+        if (out_ane_ms) *out_ane_ms += t_ane.elapsed_ms();
+        matvec(z, dw.in_proj_z, x, lin_total_val_, hidden_size_);
+    } else {
+        if (!ane_matvec(ane_layers_[L].first_proj, qkv_z, x,
+                        hidden_size_, lin_qkv_dim_ + lin_total_val_)) {
+            fprintf(stderr, "ANE first_proj eval failed at layer %d (DeltaNet)\n", L);
+            return false;
+        }
+        if (out_ane_ms) *out_ane_ms += t_ane.elapsed_ms();
+    }
 
     float* a_vec = session.scratch_tmp;
     float* b_vec = session.scratch_tmp + lin_num_val_heads_;
@@ -759,24 +875,32 @@ bool Qwen35Model::forward_deltanet_core(Session& session, int L, float* x, float
         }
     }
 
-    for (int h = 0; h < lin_num_val_heads_; h++) {
-        rmsnorm_gated(pre_oproj + h * lin_val_dim_,
-                      y + h * lin_val_dim_,
-                      z + h * lin_val_dim_,
-                      dw.norm_w, lin_val_dim_);
+    if (qwen35_batch_rmsgate()) {
+        rmsnorm_gated_repeated(pre_oproj, y, z, dw.norm_w,
+                               lin_num_val_heads_, lin_val_dim_,
+                               session.scratch_tmp);
+    } else {
+        for (int h = 0; h < lin_num_val_heads_; h++) {
+            rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                          y + h * lin_val_dim_,
+                          z + h * lin_val_dim_,
+                          dw.norm_w, lin_val_dim_);
+        }
     }
     return true;
 }
 
-bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, float* pre_oproj, int pos) {
+bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, float* pre_oproj, int pos, double* out_ane_ms) {
     auto& fw = layers_[L].full_attn;
 
     float* qkv_buf = session.scratch_qkv;
+    Timer t_ane;
     if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x,
                     hidden_size_, full_q_dim_ + full_kv_dim_ * 2)) {
         fprintf(stderr, "ANE first_proj eval failed at layer %d (FullAttn)\n", L);
         return false;
     }
+    if (out_ane_ms) *out_ane_ms += t_ane.elapsed_ms();
 
     float* q_gate_raw = qkv_buf;
     float* k_raw = qkv_buf + full_q_dim_;
@@ -837,6 +961,14 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
 float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
 
+    // Auto-select CPU prefill for long prompts (GEMM >> ANE matvec loops)
+    static const char* cpu_env = getenv("ANE_CPU_PREFILL");
+    bool cpu_prefill_enabled = cpu_env ? (atoi(cpu_env) != 0) : true;  // on by default
+    int cpu_threshold = 32;  // tokens above this use CPU
+    if (cpu_prefill_enabled && (int)token_ids.size() > cpu_threshold && !cpu_weights_.empty() && cpu_weights_[0].first_proj) {
+        return prefill_cpu(session, token_ids, start_pos);
+    }
+
     int batch_size = qwen35_prefill_batch_size();
     if (batch_size <= 1 || token_ids.size() == 1) {
         float* logits = nullptr;
@@ -876,7 +1008,9 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
             }
 
             const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
-            const int proj_dim = is_linear ? (lin_qkv_dim_ + lin_total_val_) : (full_q_dim_ + 2 * full_kv_dim_);
+            const int proj_dim = is_linear
+                ? (qwen35_linear_z_on_cpu() ? lin_qkv_dim_ : (lin_qkv_dim_ + lin_total_val_))
+                : (full_q_dim_ + 2 * full_kv_dim_);
             for (int b = 0; b < batch; b++) {
                 if (!ane_matvec(ane_layers_[L].first_proj,
                                 proj_batch.data() + (size_t)b * max_proj_dim,
@@ -898,6 +1032,9 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
 
                     float* mixed_qkv = proj;
                     float* z = proj + lin_qkv_dim_;
+                    if (qwen35_linear_z_on_cpu()) {
+                        matvec(z, dw.in_proj_z, x_norm, lin_total_val_, hidden_size_);
+                    }
 
                     float* a_vec = session.scratch_tmp;
                     float* b_vec = session.scratch_tmp + lin_num_val_heads_;
@@ -936,11 +1073,17 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
                         }
                     }
 
-                    for (int h = 0; h < lin_num_val_heads_; h++) {
-                        rmsnorm_gated(pre_oproj + h * lin_val_dim_,
-                                      y + h * lin_val_dim_,
-                                      z + h * lin_val_dim_,
-                                      dw.norm_w, lin_val_dim_);
+                    if (qwen35_batch_rmsgate()) {
+                        rmsnorm_gated_repeated(pre_oproj, y, z, dw.norm_w,
+                                               lin_num_val_heads_, lin_val_dim_,
+                                               session.scratch_tmp);
+                    } else {
+                        for (int h = 0; h < lin_num_val_heads_; h++) {
+                            rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                                          y + h * lin_val_dim_,
+                                          z + h * lin_val_dim_,
+                                          dw.norm_w, lin_val_dim_);
+                        }
                     }
                 } else {
                     auto& fw = layers_[L].full_attn;
@@ -1092,6 +1235,260 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
     return session.logits;
 }
 
+
+float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_ids, int start_pos) {
+    if (token_ids.empty()) return nullptr;
+    const int N = (int)token_ids.size();
+
+    // Check CPU weights are available
+    if (cpu_weights_.empty() || !cpu_weights_[0].first_proj) {
+        fprintf(stderr, "[cpu_prefill] CPU weights not loaded, falling back to ANE\n");
+        return prefill(session, token_ids, start_pos);
+    }
+
+    Timer total_timer;
+
+    // Allocate batch buffers
+    const int H = hidden_size_;
+    const int I = intermediate_size_;
+    const int max_proj = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
+    const int max_attn = std::max(lin_total_val_, full_out_dim_);
+
+    std::vector<float> X(     (size_t)N * H);       // hidden states [N × H]
+    std::vector<float> X_norm((size_t)N * H);       // normalized [N × H]
+    std::vector<float> Proj(  (size_t)N * max_proj); // projections [N × proj_dim]
+    std::vector<float> Oproj( (size_t)N * max_attn); // pre-oproj [N × attn_dim]
+    std::vector<float> Attn(  (size_t)N * H);       // attention output [N × H]
+    std::vector<float> Gate(  (size_t)N * I);        // FFN gate [N × I]
+    std::vector<float> Up(    (size_t)N * I);        // FFN up [N × I]
+    std::vector<float> Down(  (size_t)N * H);        // FFN down output [N × H]
+
+    // Embedding lookup
+    for (int i = 0; i < N; i++) {
+        memcpy(X.data() + (size_t)i * H,
+               embed_tokens_ + (int64_t)token_ids[i] * H,
+               (size_t)H * sizeof(float));
+    }
+
+    double total_gemm_ms = 0, total_attn_ms = 0, total_ffn_ms = 0;
+    for (int L = 0; L < num_layers_; L++) {
+        auto& cw = cpu_weights_[L];
+
+        // 1. RMSNorm
+        for (int i = 0; i < N; i++) {
+            rmsnorm(X_norm.data() + (size_t)i * H,
+                    X.data() + (size_t)i * H,
+                    layers_[L].input_layernorm, H, rms_eps_);
+        }
+
+        const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
+        const int proj_rows = cw.first_proj_rows;
+
+        // 2. First projection via GEMM: Proj = X_norm @ W^T  [N×H] × [H×proj_rows]^T = [N×proj_rows]
+        //    W is stored row-major [proj_rows × H], so W^T means CblasTrans
+        Timer gemm_timer;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, proj_rows, H, 1.0f,
+                    X_norm.data(), H,
+                    cw.first_proj, H,
+                    0.0f, Proj.data(), max_proj);
+
+        // Also compute Z projection for linear layers
+        if (is_linear && cw.first_proj_b) {
+            // Z = X_norm @ W_z^T, store after the QKV part in Proj
+            // We need it per-token in the attention core below
+            // Store in a temp or interleave — simplest: compute inline per-token below
+        }
+
+        total_gemm_ms += gemm_timer.elapsed_ms();
+
+        // 3. Per-token attention core (sequential — updates recurrent state)
+        Timer attn_timer;
+        for (int i = 0; i < N; i++) {
+            float* x_norm = X_norm.data() + (size_t)i * H;
+            float* proj = Proj.data() + (size_t)i * max_proj;
+            float* pre_oproj = Oproj.data() + (size_t)i * max_attn;
+            int pos = start_pos + i;
+
+            if (is_linear) {
+                auto& dw = layers_[L].deltanet;
+                float* mixed_qkv = proj;
+
+                // Z projection — need per-token since it feeds gating
+                float z_buf[lin_total_val_];
+                if (cw.first_proj_b) {
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                                cw.first_proj_b_rows, H, 1.0f,
+                                cw.first_proj_b, H,
+                                x_norm, 1, 0.0f, z_buf, 1);
+                }
+
+                float* a_vec = session.scratch_tmp;
+                float* b_vec = session.scratch_tmp + lin_num_val_heads_;
+                matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, H);
+                matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, H);
+
+                float* conv_out = session.scratch_conv;
+                conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L],
+                              mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
+
+                float* Q = conv_out;
+                float* K = conv_out + lin_total_key_;
+                float* V = conv_out + lin_total_key_ * 2;
+                float* y = session.scratch_y;
+                float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
+                int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+
+                for (int kh = 0; kh < lin_num_heads_; kh++) {
+                    float* qh = Q + kh * lin_key_dim_;
+                    float* kh_ptr = K + kh * lin_key_dim_;
+                    l2_normalize(qh, lin_key_dim_);
+                    l2_normalize(kh_ptr, lin_key_dim_);
+                    float qs = q_scale;
+                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* vh_ptr = V + vh * lin_val_dim_;
+                        float* yh = y + vh * lin_val_dim_;
+                        float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
+                        float beta = sigmoid_f(b_vec[vh]);
+                        float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
+                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
+                    }
+                }
+
+                for (int h = 0; h < lin_num_val_heads_; h++) {
+                    rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                                  y + h * lin_val_dim_,
+                                  z_buf + h * lin_val_dim_,
+                                  dw.norm_w, lin_val_dim_);
+                }
+            } else {
+                auto& fw = layers_[L].full_attn;
+                float* q_gate_raw = proj;
+                float* k_raw = proj + full_q_dim_;
+                float* v_raw = proj + full_q_dim_ + full_kv_dim_;
+
+                for (int h = 0; h < num_q_heads_; h++) {
+                    float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
+                    rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
+                }
+                for (int h = 0; h < num_kv_heads_; h++) {
+                    rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
+                }
+
+                const float* rope_cos_row = nullptr;
+                const float* rope_sin_row = nullptr;
+                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                    int half_rot = rot_dim_ / 2;
+                    rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+                    rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+                }
+                apply_rope_cached(q_gate_raw, k_raw, num_q_heads_, num_kv_heads_,
+                                  head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
+                                  rope_cos_row, rope_sin_row);
+
+                int slot;
+                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                    slot = session.kv_start[L] + session.kv_len[L];
+                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    session.kv_len[L]++;
+                } else {
+                    slot = session.kv_start[L];
+                    session.kv_start[L]++;
+                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                }
+                size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
+                memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+
+                gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
+                              num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                              session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+
+                if (attn_output_gate_) {
+                    for (int h = 0; h < num_q_heads_; h++) {
+                        float* oh = pre_oproj + h * head_dim_;
+                        const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
+                        mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
+                    }
+                }
+            }
+        }
+
+        total_attn_ms += attn_timer.elapsed_ms();
+
+        // 4. O projection via GEMM: Attn = Oproj @ W_o^T  [N×attn_dim] × [attn_dim×H]^T = [N×H]
+        Timer oproj_timer;
+        const int attn_dim = cw.o_proj_in;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, H, attn_dim, 1.0f,
+                    Oproj.data(), max_attn,
+                    cw.o_proj, attn_dim,
+                    0.0f, Attn.data(), H);
+
+        // 5. Residual add: X += Attn
+        for (int i = 0; i < N * H; i++) X[i] += Attn[i];
+
+        // 6. Post-attention RMSNorm
+        for (int i = 0; i < N; i++) {
+            rmsnorm(X_norm.data() + (size_t)i * H,
+                    X.data() + (size_t)i * H,
+                    layers_[L].post_attention_layernorm, H, rms_eps_);
+        }
+
+        total_gemm_ms += oproj_timer.elapsed_ms();
+
+        // 7. FFN via GEMM
+        Timer ffn_timer;
+        // Gate = X_norm @ W_gate^T  [N×H] × [H×I]^T = [N×I]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, I, H, 1.0f,
+                    X_norm.data(), H,
+                    cw.gate_proj, H,
+                    0.0f, Gate.data(), I);
+
+        // Up = X_norm @ W_up^T  [N×H] × [H×I]^T = [N×I]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, I, H, 1.0f,
+                    X_norm.data(), H,
+                    cw.up_proj, H,
+                    0.0f, Up.data(), I);
+
+        // SwiGLU: Gate = silu(Gate) * Up
+        for (int i = 0; i < N * I; i++) {
+            float g = Gate[i];
+            float s = g / (1.0f + expf(-g));  // silu
+            Gate[i] = s * Up[i];
+        }
+
+        // Down = Gate @ W_down^T  [N×I] × [I×H]^T = [N×H]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, H, I, 1.0f,
+                    Gate.data(), I,
+                    cw.down_proj, I,
+                    0.0f, Down.data(), H);
+
+        // 8. Residual add: X += Down
+        for (int i = 0; i < N * H; i++) X[i] += Down[i];
+        total_ffn_ms += ffn_timer.elapsed_ms();
+    }
+
+    // Final norm + LM head
+    float* last_hidden = X.data() + (size_t)(N - 1) * H;
+    rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
+
+    // LM head via GEMM (single token — just matvec)
+    matvec(session.logits, cpu_lm_head_, session.x, vocab_size_, H);
+
+    double elapsed = total_timer.elapsed_ms();
+    fprintf(stderr, "[cpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms ffn=%.0fms\n",
+            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, total_ffn_ms);
+
+    return session.logits;
+}
+
 bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch) {
     if (!sessions || !token_ids || !positions || batch <= 0) return false;
     if (batch == 1) {
@@ -1152,7 +1549,9 @@ bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const 
         if (do_profile) rms1_ms += t_stage.elapsed_ms();
 
         const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
-        const int proj_dim = is_linear ? (lin_qkv_dim_ + lin_total_val_) : (full_q_dim_ + 2 * full_kv_dim_);
+        const int proj_dim = is_linear
+            ? (qwen35_linear_z_on_cpu() ? lin_qkv_dim_ : (lin_qkv_dim_ + lin_total_val_))
+            : (full_q_dim_ + 2 * full_kv_dim_);
         t_stage.reset();
         if (!ane_matvec_batch(ane_layers_[L].first_proj,
                               proj_batch.data(), x_norm_batch.data(),
@@ -1175,6 +1574,9 @@ bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const 
 
                 float* mixed_qkv = proj;
                 float* z = proj + lin_qkv_dim_;
+                if (qwen35_linear_z_on_cpu()) {
+                    matvec(z, dw.in_proj_z, x_norm, lin_total_val_, hidden_size_);
+                }
 
                 float* a_vec = session.scratch_tmp;
                 float* b_vec = session.scratch_tmp + lin_num_val_heads_;
@@ -1213,11 +1615,17 @@ bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const 
                     }
                 }
 
-                for (int h = 0; h < lin_num_val_heads_; h++) {
-                    rmsnorm_gated(pre_oproj + h * lin_val_dim_,
-                                  y + h * lin_val_dim_,
-                                  z + h * lin_val_dim_,
-                                  dw.norm_w, lin_val_dim_);
+                if (qwen35_batch_rmsgate()) {
+                    rmsnorm_gated_repeated(pre_oproj, y, z, dw.norm_w,
+                                           lin_num_val_heads_, lin_val_dim_,
+                                           session.scratch_tmp);
+                } else {
+                    for (int h = 0; h < lin_num_val_heads_; h++) {
+                        rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                                      y + h * lin_val_dim_,
+                                      z + h * lin_val_dim_,
+                                      dw.norm_w, lin_val_dim_);
+                    }
                 }
             } else {
                 auto& fw = layers_[L].full_attn;
@@ -1398,26 +1806,79 @@ bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const 
     return true;
 }
 
+static bool profile_forward_enabled() {
+    static bool enabled = getenv("PROFILE_FORWARD") != nullptr;
+    return enabled;
+}
+
+struct ForwardProfile {
+    uint64_t calls = 0;
+    double rms1_ms = 0.0;
+    double first_proj_ms = 0.0;
+    double attn_core_ms = 0.0;
+    double oproj_ms = 0.0;
+    double rms2_ms = 0.0;
+    double ffn_ms = 0.0;
+    double final_norm_ms = 0.0;
+    double lm_head_ms = 0.0;
+
+    void print_and_reset() {
+        double total = rms1_ms + first_proj_ms + attn_core_ms + oproj_ms + rms2_ms + ffn_ms + final_norm_ms + lm_head_ms;
+        fprintf(stderr,
+            "\n=== Qwen3.5 forward profile (%llu tokens, avg %.2f ms/tok) ===\n"
+            "  rms1 (input norm):    %6.2f ms (%4.1f%%)\n"
+            "  first_proj (ANE):     %6.2f ms (%4.1f%%)\n"
+            "  attn_core (CPU):      %6.2f ms (%4.1f%%)\n"
+            "  oproj_add (ANE):      %6.2f ms (%4.1f%%)\n"
+            "  rms2 (post-attn):     %6.2f ms (%4.1f%%)\n"
+            "  ffn_resadd (ANE):     %6.2f ms (%4.1f%%)\n"
+            "  final_norm (CPU):     %6.2f ms (%4.1f%%)\n"
+            "  lm_head (ANE):        %6.2f ms (%4.1f%%)\n"
+            "  TOTAL:                %6.2f ms → %.1f tok/s\n",
+            (unsigned long long)calls, total / calls,
+            rms1_ms / calls, 100.0 * rms1_ms / total,
+            first_proj_ms / calls, 100.0 * first_proj_ms / total,
+            attn_core_ms / calls, 100.0 * attn_core_ms / total,
+            oproj_ms / calls, 100.0 * oproj_ms / total,
+            rms2_ms / calls, 100.0 * rms2_ms / total,
+            ffn_ms / calls, 100.0 * ffn_ms / total,
+            final_norm_ms / calls, 100.0 * final_norm_ms / total,
+            lm_head_ms / calls, 100.0 * lm_head_ms / total,
+            total / calls, 1000.0 * calls / total);
+        calls = 0;
+        rms1_ms = rms2_ms = first_proj_ms = attn_core_ms = oproj_ms = ffn_ms = final_norm_ms = lm_head_ms = 0.0;
+    }
+};
+
+static ForwardProfile g_fwd_profile;
+
 float* Qwen35Model::forward(int token, int pos) {
     if (!default_session_) return nullptr;
     return forward(*default_session_, token, pos);
 }
 
 float* Qwen35Model::forward(Session& session, int token, int pos) {
+    const bool do_profile = profile_forward_enabled();
     memcpy(session.x, embed_tokens_ + (int64_t)token * hidden_size_, hidden_size_ * sizeof(float));
 
     float* pre_oproj = session.scratch_attn;
+    double rms1 = 0, first_proj = 0, attn_core = 0, oproj = 0, rms2 = 0, ffn = 0;
 
     for (int L = 0; L < num_layers_; L++) {
+        Timer t;
         rmsnorm(session.x_norm, session.x, layers_[L].input_layernorm, hidden_size_, rms_eps_);
+        if (do_profile) rms1 += t.elapsed_ms();
 
+        t.reset();
         if (layer_types_[L] == LayerType::LinearAttention) {
-            if (!forward_deltanet_core(session, L, session.x_norm, pre_oproj)) return nullptr;
+            if (!forward_deltanet_core(session, L, session.x_norm, pre_oproj, do_profile ? &first_proj : nullptr)) return nullptr;
         } else {
-            if (!forward_full_attn_core(session, L, session.x_norm, pre_oproj, pos)) return nullptr;
+            if (!forward_full_attn_core(session, L, session.x_norm, pre_oproj, pos, do_profile ? &first_proj : nullptr)) return nullptr;
         }
+        if (do_profile) attn_core += t.elapsed_ms();
 
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
+        t.reset();
         if (ane_layers_[L].oproj_add) {
             if (!ane_eval_oproj_add(ane_layers_[L].oproj_add, session.x, pre_oproj, session.x, attn_dim, hidden_size_)) {
                 fprintf(stderr, "ANE oproj_add eval failed at layer %d\n", L);
@@ -1431,9 +1892,13 @@ float* Qwen35Model::forward(Session& session, int token, int pos) {
             }
             for (int i = 0; i < hidden_size_; i++) session.x[i] += attn_out[i];
         }
+        if (do_profile) oproj += t.elapsed_ms();
 
+        t.reset();
         rmsnorm(session.x_norm, session.x, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+        if (do_profile) rms2 += t.elapsed_ms();
 
+        t.reset();
         if (ane_layers_[L].ffn_resadd) {
             if (!ane_eval_fused_ffn_resadd(ane_layers_[L].ffn_resadd, session.x, session.x_norm, session.x, hidden_size_)) {
                 fprintf(stderr, "ANE ffn_resadd eval failed at layer %d\n", L);
@@ -1458,10 +1923,14 @@ float* Qwen35Model::forward(Session& session, int token, int pos) {
 
             for (int i = 0; i < hidden_size_; i++) session.x[i] += mlp_out[i];
         }
+        if (do_profile) ffn += t.elapsed_ms();
     }
 
+    Timer t;
     rmsnorm(session.x, session.x, final_norm_, hidden_size_, rms_eps_);
+    double final_norm = do_profile ? t.elapsed_ms() : 0.0;
 
+    t.reset();
     if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         bool ok = true;
         int chunks = (int)lm_head_kernels_.size();
@@ -1481,6 +1950,22 @@ float* Qwen35Model::forward(Session& session, int token, int pos) {
         }
     } else {
         matvec(session.logits, lm_head_, session.x, vocab_size_, hidden_size_);
+    }
+    double lm_head_time = do_profile ? t.elapsed_ms() : 0.0;
+
+    if (do_profile) {
+        g_fwd_profile.calls++;
+        g_fwd_profile.rms1_ms += rms1;
+        g_fwd_profile.first_proj_ms += first_proj;
+        g_fwd_profile.attn_core_ms += attn_core - first_proj;
+        g_fwd_profile.oproj_ms += oproj;
+        g_fwd_profile.rms2_ms += rms2;
+        g_fwd_profile.ffn_ms += ffn;
+        g_fwd_profile.final_norm_ms += final_norm;
+        g_fwd_profile.lm_head_ms += lm_head_time;
+        if (g_fwd_profile.calls % 50 == 0) {
+            g_fwd_profile.print_and_reset();
+        }
     }
 
     return session.logits;

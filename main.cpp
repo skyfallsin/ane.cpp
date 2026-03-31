@@ -482,8 +482,10 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
     std::condition_variable cv;
     std::vector<std::unique_ptr<ServeRequest>> pending;
     std::vector<std::unique_ptr<ServeRequest>> active;
+    fprintf(stderr, "[boot] allocating %d sessions...\n", args.sessions);
     std::vector<std::unique_ptr<Qwen35Model::Session>> available_sessions;
     for (int i = 0; i < args.sessions; i++) {
+        fprintf(stderr, "[boot] creating session %d/%d...\n", i + 1, args.sessions);
         auto session = model.create_session();
         if (!session) {
             fprintf(stderr, "Error: failed to allocate serve session %d\n", i + 1);
@@ -491,8 +493,10 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
         }
         model.reset_session(*session);
         available_sessions.push_back(std::move(session));
+        fprintf(stderr, "[boot] session %d/%d ready\n", i + 1, args.sessions);
     }
 
+    fprintf(stderr, "[boot] creating socket...\n");
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         fprintf(stderr, "socket failed: %s\n", strerror(errno));
@@ -516,14 +520,19 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
         return 1;
     }
 
+    fprintf(stderr, "[boot] socket bound and listening\n");
     fprintf(stderr, "ane.cpp serve: OpenAI-compatible API at http://127.0.0.1:%d/v1\n", args.port);
     fprintf(stderr, "  model: %s, sessions: %d\n", model_name.c_str(), args.sessions);
 
+    fprintf(stderr, "[boot] starting scheduler thread...\n");
     // Scheduler thread — batched decode with per-token streaming
     std::thread scheduler([&] {
+        fprintf(stderr, "[boot] scheduler thread running\n");
         while (true) {
             std::unique_lock<std::mutex> lock(mu);
             cv.wait(lock, [&] { return !pending.empty() || !active.empty(); });
+            fprintf(stderr, "[sched] woke: pending=%zu active=%zu avail=%zu\n",
+                    pending.size(), active.size(), available_sessions.size());
 
             while (!pending.empty() && !available_sessions.empty()) {
                 auto req = std::move(pending.front());
@@ -535,9 +544,11 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
             }
 
             if (active.empty()) {
+                fprintf(stderr, "[sched] no active requests, waiting...\n");
                 continue;
             }
 
+            fprintf(stderr, "[sched] processing batch of %zu\n", active.size());
             auto batch = std::move(active);
             active.clear();
             lock.unlock();
@@ -560,8 +571,22 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                         }
                     }
                     req->prompt_tokens = tokenizer.encode(formatted);
+                    // Truncate to fit context: keep last (max_context - max_gen) tokens
+                    int max_context = 8192;
+                    int reserve_for_gen = (req->max_tokens > 0)
+                        ? std::min(req->max_tokens, max_context / 2) : max_context / 2;
+                    int max_prompt = max_context - reserve_for_gen;
+                    if ((int)req->prompt_tokens.size() > max_prompt) {
+                        int drop = (int)req->prompt_tokens.size() - max_prompt;
+                        fprintf(stderr, "[sched] truncating %s: %d -> %d tokens (dropped %d from front)\n",
+                                req->request_id.c_str(), (int)req->prompt_tokens.size(), max_prompt, drop);
+                        req->prompt_tokens.erase(req->prompt_tokens.begin(),
+                                                 req->prompt_tokens.begin() + drop);
+                    }
                     req->prompt_token_count = (int)req->prompt_tokens.size();
                     req->sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
+                    fprintf(stderr, "[sched] prefilling %s: %d tokens...\n",
+                            req->request_id.c_str(), (int)req->prompt_tokens.size());
                     Timer prefill_timer;
                     req->logits = model.prefill(*req->session, req->prompt_tokens, 0);
                     if (!req->logits) {
@@ -659,6 +684,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
         }
     });
     scheduler.detach();
+    fprintf(stderr, "[boot] entering accept loop\n");
 
     // Accept loop — parse HTTP requests and route
     while (true) {
@@ -667,11 +693,15 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
             fprintf(stderr, "accept failed: %s\n", strerror(errno));
             continue;
         }
+        fprintf(stderr, "[http] accepted connection fd=%d\n", client_fd);
 
         std::thread([client_fd, &mu, &cv, &pending, &args, &model_name,
                      server_created] {
             HttpRequest http = parse_http_request(client_fd);
+            fprintf(stderr, "[http] parsed: valid=%d method=%s path=%s body=%zu bytes\n",
+                    http.valid, http.method.c_str(), http.path.c_str(), http.body.size());
             if (!http.valid) {
+                fprintf(stderr, "[http] invalid request, closing fd=%d\n", client_fd);
                 close(client_fd);
                 return;
             }
@@ -706,8 +736,11 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
 
             // POST /v1/chat/completions
             if (http.method == "POST" && http.path == "/v1/chat/completions") {
+                fprintf(stderr, "[http] chat/completions request, parsing body...\n");
                 auto body = nlohmann::json::parse(http.body, nullptr, false);
                 if (body.is_discarded() || !body.contains("messages")) {
+                    fprintf(stderr, "[http] invalid body: discarded=%d has_messages=%d\n",
+                            body.is_discarded(), body.contains("messages"));
                     nlohmann::json err = {
                         {"error", {{"message", "Invalid request: 'messages' required"},
                                    {"type", "invalid_request_error"}}}
@@ -763,6 +796,9 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                     req->sampling.top_k = args.top_k;
                 }
 
+                fprintf(stderr, "[http] parsed %zu messages, stream=%d, max_tokens=%d\n",
+                        req->messages.size(), req->stream, req->max_tokens);
+
                 // Enable thinking: check multiple conventions
                 req->enable_thinking = args.enable_thinking;
                 if (body.contains("enable_thinking")) {
@@ -774,6 +810,8 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                     }
                 }
 
+                fprintf(stderr, "[http] queuing request %s thinking=%d\n",
+                        req->request_id.c_str(), req->enable_thinking);
                 {
                     std::lock_guard<std::mutex> lock(mu);
                     pending.push_back(std::move(req));
