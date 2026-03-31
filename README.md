@@ -19,17 +19,23 @@ The field guide documents the reverse-engineering work behind the runtime and fo
 
 Current measurements on the M3 Max test machine:
 
-| Model | Prompt throughput | Generate throughput | Notes |
-|---|---:|---:|---|
-| **Qwen3-4B** | **26.59 tok/s** | **7.27 tok/s** | Batched prefill path enabled |
-| **Qwen3.5-4B** | **13.68 tok/s** | **8.37 tok/s** | Fastest single-user path measured so far |
-| **Qwen3.5-9B** | **3.97 tok/s** | **4.27 tok/s** | Runs end-to-end on ANE |
+| Model | Mode | Prompt throughput | Generate throughput |
+|---|---|---:|---:|
+| **Qwen3.5-4B** | fp16 | **18.93 tok/s** | **9.21 tok/s** |
+| **Qwen3.5-4B** | int8 | **30.08 tok/s** | **11.66 tok/s** |
+| **Qwen3.5-9B** | fp16 | **6.49 tok/s** | **4.27 tok/s** |
+| **Qwen3.5-9B** | int8 | **7.39 tok/s** | **7.01 tok/s** |
 
-Shared-process serve mode on **Qwen3.5-4B** reached:
+Single-user numbers are warmed 5-run medians at 500 generated tokens with Qwen thinking defaults (`--enable-thinking`, `top_p=0.95`, `top_k=20`, `presence_penalty=1.5`, `repeat_penalty=1.0`, `temp=1.0`).
 
-- **7.18 tok/s** aggregate at 1 active request
-- **8.55 tok/s** aggregate at 2 active requests
-- **12.9–13.1 tok/s** aggregate at 4 active requests
+Shared-process serve mode (8 requests, 100 tokens/request, 3 repeats, `--sessions 4`) — aggregate generation throughput:
+
+| Model | Mode | c1 | c2 | c4 |
+|---|---|---:|---:|---:|
+| Qwen3.5-4B | fp16 | 8.62 | 12.59 | 20.75 |
+| Qwen3.5-4B | int8 | 10.53 | 15.95 | 28.62 |
+| Qwen3.5-9B | fp16 | 3.62 | 4.44 | 4.89 |
+| Qwen3.5-9B | int8 | 5.76 | 5.81 | 6.57 |
 
 These numbers come from the companion field guide's current measurements and should be treated as hardware- and setup-specific rather than general benchmarks.
 
@@ -97,6 +103,7 @@ These commands create local model directories such as `./Qwen3-4B`, which can th
 
 ```bash
 ANE_PREFILL_BATCH=4                # W-lane prefill batching (default 4, max 32)
+ANE_USE_DIRECT_EVAL=1              # use _ANEClient direct eval path when available (set 0 to force daemon path)
 ANE_SPECULATIVE_DECODE=1           # experimental speculative decode for Qwen3
 ANE_SPECULATIVE_BATCH=32           # speculative verify batch size / W-lanes to use (default 32)
 ANE_SPECULATIVE_DRAFT_LAYERS=2     # truncated self-draft depth (default 2)
