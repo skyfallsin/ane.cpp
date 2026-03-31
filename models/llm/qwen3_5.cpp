@@ -1236,11 +1236,11 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
 }
 
 
+
 float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
     const int N = (int)token_ids.size();
 
-    // Check CPU weights are available
     if (cpu_weights_.empty() || !cpu_weights_[0].first_proj) {
         fprintf(stderr, "[cpu_prefill] CPU weights not loaded, falling back to ANE\n");
         return prefill(session, token_ids, start_pos);
@@ -1248,20 +1248,25 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
 
     Timer total_timer;
 
-    // Allocate batch buffers
     const int H = hidden_size_;
     const int I = intermediate_size_;
     const int max_proj = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
     const int max_attn = std::max(lin_total_val_, full_out_dim_);
 
-    std::vector<float> X(     (size_t)N * H);       // hidden states [N × H]
-    std::vector<float> X_norm((size_t)N * H);       // normalized [N × H]
-    std::vector<float> Proj(  (size_t)N * max_proj); // projections [N × proj_dim]
-    std::vector<float> Oproj( (size_t)N * max_attn); // pre-oproj [N × attn_dim]
-    std::vector<float> Attn(  (size_t)N * H);       // attention output [N × H]
-    std::vector<float> Gate(  (size_t)N * I);        // FFN gate [N × I]
-    std::vector<float> Up(    (size_t)N * I);        // FFN up [N × I]
-    std::vector<float> Down(  (size_t)N * H);        // FFN down output [N × H]
+    // Persistent batch buffers
+    std::vector<float> X(     (size_t)N * H);
+    std::vector<float> X_norm((size_t)N * H);
+    std::vector<float> Proj(  (size_t)N * max_proj);
+    std::vector<float> Oproj( (size_t)N * max_attn);
+    std::vector<float> Attn(  (size_t)N * H);
+    std::vector<float> Gate(  (size_t)N * I);
+    std::vector<float> Up(    (size_t)N * I);
+    std::vector<float> Down(  (size_t)N * H);
+
+    // Pre-allocate batched Z/A/B projection buffers for DeltaNet layers
+    std::vector<float> Z_batch((size_t)N * lin_total_val_);
+    std::vector<float> A_batch((size_t)N * lin_num_val_heads_);
+    std::vector<float> B_batch((size_t)N * lin_num_val_heads_);
 
     // Embedding lookup
     for (int i = 0; i < N; i++) {
@@ -1271,6 +1276,8 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
     }
 
     double total_gemm_ms = 0, total_attn_ms = 0, total_ffn_ms = 0;
+    double delta_attn_ms = 0, full_attn_ms = 0;
+
     for (int L = 0; L < num_layers_; L++) {
         auto& cw = cpu_weights_[L];
 
@@ -1284,28 +1291,47 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
         const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
         const int proj_rows = cw.first_proj_rows;
 
-        // 2. First projection via GEMM: Proj = X_norm @ W^T  [N×H] × [H×proj_rows]^T = [N×proj_rows]
-        //    W is stored row-major [proj_rows × H], so W^T means CblasTrans
+        // 2. Batched projections via GEMM
         Timer gemm_timer;
+
+        // First projection: QKV
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     N, proj_rows, H, 1.0f,
                     X_norm.data(), H,
                     cw.first_proj, H,
                     0.0f, Proj.data(), max_proj);
 
-        // Also compute Z projection for linear layers
-        if (is_linear && cw.first_proj_b) {
-            // Z = X_norm @ W_z^T, store after the QKV part in Proj
-            // We need it per-token in the attention core below
-            // Store in a temp or interleave — simplest: compute inline per-token below
+        if (is_linear) {
+            // Batch Z projection: Z_batch = X_norm @ W_z^T  [N×H] × [H×lin_total_val]
+            if (cw.first_proj_b) {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            N, cw.first_proj_b_rows, H, 1.0f,
+                            X_norm.data(), H,
+                            cw.first_proj_b, H,
+                            0.0f, Z_batch.data(), lin_total_val_);
+            }
+
+            // Batch A projection: A_batch = X_norm @ W_a^T  [N×H] × [H×num_val_heads]
+            auto& dw = layers_[L].deltanet;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        N, lin_num_val_heads_, H, 1.0f,
+                        X_norm.data(), H,
+                        dw.in_proj_a, H,
+                        0.0f, A_batch.data(), lin_num_val_heads_);
+
+            // Batch B projection: B_batch = X_norm @ W_b^T  [N×H] × [H×num_val_heads]
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        N, lin_num_val_heads_, H, 1.0f,
+                        X_norm.data(), H,
+                        dw.in_proj_b, H,
+                        0.0f, B_batch.data(), lin_num_val_heads_);
         }
 
         total_gemm_ms += gemm_timer.elapsed_ms();
 
-        // 3. Per-token attention core (sequential — updates recurrent state)
+        // 3. Per-token attention core
         Timer attn_timer;
         for (int i = 0; i < N; i++) {
-            float* x_norm = X_norm.data() + (size_t)i * H;
             float* proj = Proj.data() + (size_t)i * max_proj;
             float* pre_oproj = Oproj.data() + (size_t)i * max_attn;
             int pos = start_pos + i;
@@ -1313,25 +1339,14 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
             if (is_linear) {
                 auto& dw = layers_[L].deltanet;
                 float* mixed_qkv = proj;
-
-                // Z projection — need per-token since it feeds gating
-                float z_buf[lin_total_val_];
-                if (cw.first_proj_b) {
-                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                                cw.first_proj_b_rows, H, 1.0f,
-                                cw.first_proj_b, H,
-                                x_norm, 1, 0.0f, z_buf, 1);
-                }
-
-                float* a_vec = session.scratch_tmp;
-                float* b_vec = session.scratch_tmp + lin_num_val_heads_;
-                matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, H);
-                matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, H);
+                float* z_ptr = Z_batch.data() + (size_t)i * lin_total_val_;
+                float* a_vec = A_batch.data() + (size_t)i * lin_num_val_heads_;
+                float* b_vec = B_batch.data() + (size_t)i * lin_num_val_heads_;
 
                 float* conv_out = session.scratch_conv;
                 conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L],
                               mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
+                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp);
 
                 float* Q = conv_out;
                 float* K = conv_out + lin_total_key_;
@@ -1361,7 +1376,7 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                 for (int h = 0; h < lin_num_val_heads_; h++) {
                     rmsnorm_gated(pre_oproj + h * lin_val_dim_,
                                   y + h * lin_val_dim_,
-                                  z_buf + h * lin_val_dim_,
+                                  z_ptr + h * lin_val_dim_,
                                   dw.norm_w, lin_val_dim_);
                 }
             } else {
@@ -1416,10 +1431,12 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                 }
             }
         }
+        double layer_attn = attn_timer.elapsed_ms();
+        total_attn_ms += layer_attn;
+        if (is_linear) delta_attn_ms += layer_attn;
+        else full_attn_ms += layer_attn;
 
-        total_attn_ms += attn_timer.elapsed_ms();
-
-        // 4. O projection via GEMM: Attn = Oproj @ W_o^T  [N×attn_dim] × [attn_dim×H]^T = [N×H]
+        // 4. O projection via GEMM
         Timer oproj_timer;
         const int attn_dim = cw.o_proj_in;
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -1429,7 +1446,8 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                     0.0f, Attn.data(), H);
 
         // 5. Residual add: X += Attn
-        for (int i = 0; i < N * H; i++) X[i] += Attn[i];
+        vDSP_vadd(X.data(), 1, Attn.data(), 1, X.data(), 1, (vDSP_Length)(N * H));
+        total_gemm_ms += oproj_timer.elapsed_ms();
 
         // 6. Post-attention RMSNorm
         for (int i = 0; i < N; i++) {
@@ -1438,29 +1456,27 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                     layers_[L].post_attention_layernorm, H, rms_eps_);
         }
 
-        total_gemm_ms += oproj_timer.elapsed_ms();
-
         // 7. FFN via GEMM
         Timer ffn_timer;
-        // Gate = X_norm @ W_gate^T  [N×H] × [H×I]^T = [N×I]
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     N, I, H, 1.0f,
                     X_norm.data(), H,
                     cw.gate_proj, H,
                     0.0f, Gate.data(), I);
 
-        // Up = X_norm @ W_up^T  [N×H] × [H×I]^T = [N×I]
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     N, I, H, 1.0f,
                     X_norm.data(), H,
                     cw.up_proj, H,
                     0.0f, Up.data(), I);
 
-        // SwiGLU: Gate = silu(Gate) * Up
-        for (int i = 0; i < N * I; i++) {
-            float g = Gate[i];
-            float s = g / (1.0f + expf(-g));  // silu
-            Gate[i] = s * Up[i];
+        // SwiGLU: silu(gate) * up — scalar loop (compiler auto-vectorizes)
+        {
+            const int total = N * I;
+            for (int i = 0; i < total; i++) {
+                float g = Gate[i];
+                Gate[i] = (g / (1.0f + expf(-g))) * Up[i];
+            }
         }
 
         // Down = Gate @ W_down^T  [N×I] × [I×H]^T = [N×H]
@@ -1471,20 +1487,18 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                     0.0f, Down.data(), H);
 
         // 8. Residual add: X += Down
-        for (int i = 0; i < N * H; i++) X[i] += Down[i];
+        vDSP_vadd(X.data(), 1, Down.data(), 1, X.data(), 1, (vDSP_Length)(N * H));
         total_ffn_ms += ffn_timer.elapsed_ms();
     }
 
     // Final norm + LM head
     float* last_hidden = X.data() + (size_t)(N - 1) * H;
     rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
-
-    // LM head via GEMM (single token — just matvec)
     matvec(session.logits, cpu_lm_head_, session.x, vocab_size_, H);
 
     double elapsed = total_timer.elapsed_ms();
-    fprintf(stderr, "[cpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms ffn=%.0fms\n",
-            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, total_ffn_ms);
+    fprintf(stderr, "[cpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms (delta=%.0f full=%.0f) ffn=%.0fms\n",
+            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, delta_attn_ms, full_attn_ms, total_ffn_ms);
 
     return session.logits;
 }
