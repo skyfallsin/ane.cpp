@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ane.cpp VERSION 0.1.0 LANGUAGES C CXX)
+project(ane.cpp VERSION 0.1.0 LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,7 @@ set(CORE_SOURCES
     core/cpu_ops.cpp
     core/sampling.cpp
     core/ane_runtime.cpp
+    core/metal_gemm.mm
     utils.cpp
     generate.cpp
 )
@@ -79,6 +80,8 @@ target_link_libraries(ane_cpp PRIVATE
     "-framework Foundation"
     "-framework IOSurface"
     "-framework Accelerate"
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
     "-lobjc"
 )
 

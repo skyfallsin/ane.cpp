@@ -151,6 +151,7 @@ public:
     bool forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch);
     float* prefill(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     float* prefill_cpu(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
+    float* prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     std::unique_ptr<Session> create_session() const;
     void reset_session(Session& session) const;
     void reset() override;
@@ -234,6 +235,28 @@ private:
     };
     std::vector<CPUWeights> cpu_weights_;
     float* cpu_lm_head_ = nullptr;     // may alias lm_head_ if already f32
+
+    // GPU (Metal) fp16 weight pointers for MPS-based prefill
+    // These point into Metal shared buffers (allocated via metal_alloc)
+    struct GPUWeights {
+        void* first_proj = nullptr;   // fp16 [proj_rows × hidden]
+        void* first_proj_b = nullptr; // fp16 [z_rows × hidden] (DeltaNet Z proj)
+        void* o_proj = nullptr;       // fp16 [hidden × attn_dim]
+        void* gate_proj = nullptr;    // fp16 [inter × hidden]
+        void* up_proj = nullptr;      // fp16 [inter × hidden]
+        void* down_proj = nullptr;    // fp16 [hidden × inter]
+        void* a_proj = nullptr;       // fp16 [num_val_heads × hidden] (DeltaNet A)
+        void* b_proj = nullptr;       // fp16 [num_val_heads × hidden] (DeltaNet B)
+        int first_proj_rows = 0;
+        int first_proj_b_rows = 0;
+        int o_proj_in = 0;
+    };
+    std::vector<GPUWeights> gpu_weights_;
+    void* gpu_embed_ = nullptr;        // fp16 [vocab × hidden] for embedding gather
+    void* gpu_lm_head_ = nullptr;      // fp16 [vocab × hidden]
+    bool gpu_weights_loaded_ = false;
+    bool load_gpu_weights(ModelWeights* sf);
+    void free_gpu_weights();
 
     std::vector<LayerANEKernels> ane_layers_;
 

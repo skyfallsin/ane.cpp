@@ -1,10 +1,22 @@
 #include "qwen3_5.h"
 #include "../../core/cpu_ops.h"
+#include "../../core/metal_gemm.h"
 #include <cmath>
 #include <fstream>
 #include <sys/stat.h>
 #include <mutex>
 #include <dispatch/dispatch.h>
+#include <arm_fp16.h>
+
+// Fast bulk f32 → f16 conversion using ARM __fp16 hardware
+static void f32_to_f16_bulk(uint16_t* dst, const float* src, int count) {
+    const __fp16* end = (const __fp16*)(dst + count);
+    __fp16* d = (__fp16*)dst;
+    for (int i = 0; i < count; i++) {
+        d[i] = (__fp16)src[i];
+    }
+    (void)end;
+}
 
 namespace ane_lm {
 
@@ -463,6 +475,13 @@ bool Qwen35Model::load(const std::string& model_dir) {
 
     if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
 
+    // Load GPU (Metal) fp16 weights for MPS-based prefill
+    if (metal_init()) {
+        if (!load_gpu_weights(sf.get())) {
+            LOG("GPU weight load failed, GPU prefill unavailable\n");
+        }
+    }
+
     default_session_ = create_session();
     if (!default_session_) {
         fprintf(stderr, "Failed to allocate default Qwen3.5 session\n");
@@ -699,10 +718,9 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         int ffn_chunks = ane_ffn_chunk_count(hidden_size_, intermediate_size_);
         if (ffn_chunks <= 1) {
             // Try fused FFN + residual add first
-            if (qwen35_use_merged_ffn_gu()) {
-                ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd_merged_gu(
-                    sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
-                    sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+            if (false && qwen35_use_merged_ffn_gu()) {
+                // merged_gu removed as dead end
+                (void)0;
             } else if (use_blobs) {
                 ane_layers_[L].ffn_resadd = ane_compile_fused_ffn_resadd_blob(
                     blob_path(blob_dir, name), blob_path(blob_dir, name2),
@@ -713,10 +731,9 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
                     sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
             }
             if (!ane_layers_[L].ffn_resadd) {
-                if (qwen35_use_merged_ffn_gu()) {
-                    ane_layers_[L].fused_ffn = ane_compile_fused_ffn_merged_gu(
-                        sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
-                        sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+                if (false && qwen35_use_merged_ffn_gu()) {
+                    // merged_gu removed as dead end
+                    (void)0;
                 } else if (use_blobs) {
                     ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
                         blob_path(blob_dir, name), blob_path(blob_dir, name2),
@@ -962,12 +979,21 @@ float* Qwen35Model::prefill(const std::vector<int>& token_ids, int start_pos) {
 float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
 
-    // Auto-select CPU prefill for long prompts (GEMM >> ANE matvec loops)
+    // Auto-select GEMM-based prefill for long prompts (GEMM >> ANE matvec loops)
     static const char* cpu_env = getenv("ANE_CPU_PREFILL");
-    bool cpu_prefill_enabled = cpu_env ? (atoi(cpu_env) != 0) : true;  // on by default
-    int cpu_threshold = 32;  // tokens above this use CPU
-    if (cpu_prefill_enabled && (int)token_ids.size() > cpu_threshold && !cpu_weights_.empty() && cpu_weights_[0].first_proj) {
-        return prefill_cpu(session, token_ids, start_pos);
+    static const char* gpu_env = getenv("ANE_GPU_PREFILL");
+    bool gpu_prefill_enabled = gpu_env ? (atoi(gpu_env) != 0) : true;  // on by default
+    bool cpu_prefill_enabled = cpu_env ? (atoi(cpu_env) != 0) : true;
+    int cpu_threshold = 32;  // tokens above this use GEMM path
+
+    if ((int)token_ids.size() > cpu_threshold) {
+        // Prefer GPU path when available, fall back to CPU GEMM
+        if (gpu_prefill_enabled && gpu_weights_loaded_) {
+            return prefill_gpu(session, token_ids, start_pos);
+        }
+        if (cpu_prefill_enabled && !cpu_weights_.empty() && cpu_weights_[0].first_proj) {
+            return prefill_cpu(session, token_ids, start_pos);
+        }
     }
 
     int batch_size = qwen35_prefill_batch_size();
@@ -1659,6 +1685,630 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
 
     return session.logits;
 }
+// ============ GPU Weight Loading ============
+
+bool Qwen35Model::load_gpu_weights(ModelWeights* sf) {
+    if (!metal_available()) {
+        LOG("[gpu] Metal not available, skipping GPU weight load\n");
+        return false;
+    }
+
+    Timer t;
+    gpu_weights_.resize(num_layers_);
+    char n1[256], n2[256], n3[256];
+
+    // Embedding table as fp16
+    gpu_embed_ = metal_alloc((size_t)vocab_size_ * hidden_size_ * 2);
+    if (!gpu_embed_) return false;
+    {
+        uint16_t* tmp = sf->load_bf16_to_f16("model.language_model.embed_tokens.weight",
+                                               (int64_t)vocab_size_ * hidden_size_);
+        if (!tmp) { free_gpu_weights(); return false; }
+        memcpy(gpu_embed_, tmp, (size_t)vocab_size_ * hidden_size_ * 2);
+        free(tmp);
+    }
+
+    // LM head as fp16
+    if (tie_word_embeddings_) {
+        gpu_lm_head_ = gpu_embed_;  // alias
+    } else {
+        gpu_lm_head_ = metal_alloc((size_t)vocab_size_ * hidden_size_ * 2);
+        if (!gpu_lm_head_) { free_gpu_weights(); return false; }
+        uint16_t* tmp = sf->load_bf16_to_f16("lm_head.weight", (int64_t)vocab_size_ * hidden_size_);
+        if (!tmp) { free_gpu_weights(); return false; }
+        memcpy(gpu_lm_head_, tmp, (size_t)vocab_size_ * hidden_size_ * 2);
+        free(tmp);
+    }
+
+    for (int L = 0; L < num_layers_; L++) {
+        auto& gw = gpu_weights_[L];
+
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            // QKV projection
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
+            gw.first_proj_rows = lin_qkv_dim_;
+            gw.first_proj = metal_alloc((size_t)gw.first_proj_rows * hidden_size_ * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)gw.first_proj_rows * hidden_size_);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.first_proj, tmp, (size_t)gw.first_proj_rows * hidden_size_ * 2); free(tmp); }
+
+            // Z projection
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            gw.first_proj_b_rows = lin_total_val_;
+            gw.first_proj_b = metal_alloc((size_t)gw.first_proj_b_rows * hidden_size_ * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)gw.first_proj_b_rows * hidden_size_);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.first_proj_b, tmp, (size_t)gw.first_proj_b_rows * hidden_size_ * 2); free(tmp); }
+
+            // A projection
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
+            gw.a_proj = metal_alloc((size_t)lin_num_val_heads_ * hidden_size_ * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.a_proj, tmp, (size_t)lin_num_val_heads_ * hidden_size_ * 2); free(tmp); }
+
+            // B projection
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
+            gw.b_proj = metal_alloc((size_t)lin_num_val_heads_ * hidden_size_ * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.b_proj, tmp, (size_t)lin_num_val_heads_ * hidden_size_ * 2); free(tmp); }
+
+            // O projection
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            gw.o_proj_in = lin_total_val_;
+            gw.o_proj = metal_alloc((size_t)hidden_size_ * gw.o_proj_in * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)hidden_size_ * gw.o_proj_in);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.o_proj, tmp, (size_t)hidden_size_ * gw.o_proj_in * 2); free(tmp); }
+        } else {
+            // Full attention: concat Q/K/V
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(n2, sizeof(n2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(n3, sizeof(n3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
+            int proj_rows = full_q_dim_ + 2 * full_kv_dim_;
+            gw.first_proj_rows = proj_rows;
+            gw.first_proj = metal_alloc((size_t)proj_rows * hidden_size_ * 2);
+            {
+                uint16_t* q = sf->load_bf16_to_f16(n1, (int64_t)full_q_dim_ * hidden_size_);
+                uint16_t* k = sf->load_bf16_to_f16(n2, (int64_t)full_kv_dim_ * hidden_size_);
+                uint16_t* v = sf->load_bf16_to_f16(n3, (int64_t)full_kv_dim_ * hidden_size_);
+                if (!q || !k || !v) { free(q); free(k); free(v); free_gpu_weights(); return false; }
+                uint16_t* dst = (uint16_t*)gw.first_proj;
+                memcpy(dst, q, (size_t)full_q_dim_ * hidden_size_ * 2);
+                memcpy(dst + (size_t)full_q_dim_ * hidden_size_, k, (size_t)full_kv_dim_ * hidden_size_ * 2);
+                memcpy(dst + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, v, (size_t)full_kv_dim_ * hidden_size_ * 2);
+                free(q); free(k); free(v);
+            }
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            gw.o_proj_in = full_out_dim_;
+            gw.o_proj = metal_alloc((size_t)hidden_size_ * gw.o_proj_in * 2);
+            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)hidden_size_ * gw.o_proj_in);
+              if (!tmp) { free_gpu_weights(); return false; }
+              memcpy(gw.o_proj, tmp, (size_t)hidden_size_ * gw.o_proj_in * 2); free(tmp); }
+        }
+
+        // FFN weights
+        snprintf(n1, sizeof(n1), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(n2, sizeof(n2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+        snprintf(n3, sizeof(n3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+
+        gw.gate_proj = metal_alloc((size_t)intermediate_size_ * hidden_size_ * 2);
+        { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)intermediate_size_ * hidden_size_);
+          if (!tmp) { free_gpu_weights(); return false; }
+          memcpy(gw.gate_proj, tmp, (size_t)intermediate_size_ * hidden_size_ * 2); free(tmp); }
+
+        gw.up_proj = metal_alloc((size_t)intermediate_size_ * hidden_size_ * 2);
+        { uint16_t* tmp = sf->load_bf16_to_f16(n2, (int64_t)intermediate_size_ * hidden_size_);
+          if (!tmp) { free_gpu_weights(); return false; }
+          memcpy(gw.up_proj, tmp, (size_t)intermediate_size_ * hidden_size_ * 2); free(tmp); }
+
+        gw.down_proj = metal_alloc((size_t)hidden_size_ * intermediate_size_ * 2);
+        { uint16_t* tmp = sf->load_bf16_to_f16(n3, (int64_t)hidden_size_ * intermediate_size_);
+          if (!tmp) { free_gpu_weights(); return false; }
+          memcpy(gw.down_proj, tmp, (size_t)hidden_size_ * intermediate_size_ * 2); free(tmp); }
+    }
+
+    gpu_weights_loaded_ = true;
+    LOG("[gpu] Loaded fp16 weights for %d layers into Metal buffers (%.1f MB)\n",
+        num_layers_, metal_total_alloc_bytes() / 1048576.0);
+    LOG("[gpu] Weight load time: %.1f ms\n", t.elapsed_ms());
+    return true;
+}
+
+void Qwen35Model::free_gpu_weights() {
+    for (auto& gw : gpu_weights_) {
+        metal_free(gw.first_proj);
+        metal_free(gw.first_proj_b);
+        metal_free(gw.o_proj);
+        metal_free(gw.gate_proj);
+        metal_free(gw.up_proj);
+        metal_free(gw.down_proj);
+        metal_free(gw.a_proj);
+        metal_free(gw.b_proj);
+    }
+    gpu_weights_.clear();
+    if (!tie_word_embeddings_ && gpu_lm_head_) metal_free(gpu_lm_head_);
+    metal_free(gpu_embed_);
+    gpu_embed_ = nullptr;
+    gpu_lm_head_ = nullptr;
+    gpu_weights_loaded_ = false;
+}
+
+// ============ GPU Prefill (Metal MPS) ============
+
+float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos) {
+    if (token_ids.empty()) return nullptr;
+    if (!gpu_weights_loaded_) {
+        fprintf(stderr, "[gpu_prefill] GPU weights not loaded, falling back to CPU\n");
+        return prefill_cpu(session, token_ids, start_pos);
+    }
+
+    Timer total_timer;
+    const int N = (int)token_ids.size();
+    const int H = hidden_size_;
+    const int I = intermediate_size_;
+    const int max_proj = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
+    const int max_attn = std::max(lin_total_val_, full_out_dim_);
+
+    // CPU fp32 buffers (activations, intermediates)
+    std::vector<float> X(     (size_t)N * H);
+    std::vector<float> X_norm((size_t)N * H);
+    std::vector<float> Proj(  (size_t)N * max_proj);
+    std::vector<float> Oproj( (size_t)N * max_attn);
+    std::vector<float> Attn(  (size_t)N * H);
+    std::vector<float> Gate(  (size_t)N * I);
+    std::vector<float> Up(    (size_t)N * I);
+    std::vector<float> Down(  (size_t)N * H);
+
+    // DeltaNet batch buffers
+    std::vector<float> Z_batch((size_t)N * lin_total_val_);
+    std::vector<float> A_batch((size_t)N * lin_num_val_heads_);
+    std::vector<float> B_batch((size_t)N * lin_num_val_heads_);
+    std::vector<float> conv_batch((size_t)N * lin_qkv_dim_);
+    std::vector<float> Y_batch((size_t)N * lin_total_val_);
+
+    // Full-attention batch buffers
+    std::vector<float> fullK((size_t)N * full_kv_dim_);
+    std::vector<float> fullV((size_t)N * full_kv_dim_);
+    const int fa_nqh = num_q_heads_;
+    std::vector<float> fa_scores((size_t)fa_nqh * N * N);
+    std::vector<float> fa_q_buf((size_t)fa_nqh * N * head_dim_);
+    std::vector<float> fa_k_buf((size_t)num_kv_heads_ * N * head_dim_);
+    std::vector<float> fa_v_buf((size_t)num_kv_heads_ * N * head_dim_);
+    std::vector<float> fa_out_buf((size_t)fa_nqh * N * head_dim_);
+
+    dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    // Metal shared buffers for fp16 activation input and fp32 GEMM output
+    // Largest GEMM input: [N, H] fp16 for X_norm input to projections
+    // Largest GEMM output: [N, I] fp32 for FFN gate/up projections
+    const size_t act_f16_bytes = (size_t)N * H * 2;
+    const size_t proj_f32_bytes = (size_t)N * max_proj * sizeof(float);
+    const size_t ffn_f32_bytes = (size_t)N * I * sizeof(float);
+    const size_t attn_f32_bytes = (size_t)N * H * sizeof(float);
+
+    void* gpu_act_f16 = metal_alloc(act_f16_bytes);          // [N, H] fp16 input
+    void* gpu_proj_f32 = metal_alloc(proj_f32_bytes);         // [N, max_proj] fp32 output
+    void* gpu_z_f32 = metal_alloc((size_t)N * lin_total_val_ * sizeof(float));  // Z proj output
+    void* gpu_a_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));  // A proj output
+    void* gpu_b_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));  // B proj output
+    void* gpu_oproj_f16 = metal_alloc((size_t)N * max_attn * 2);  // [N, max_attn] fp16 for o_proj input
+    void* gpu_attn_f32 = metal_alloc(attn_f32_bytes);         // [N, H] fp32 o_proj output
+    void* gpu_ffn_f16 = metal_alloc((size_t)N * H * 2);       // [N, H] fp16 for FFN input (X_norm)
+    void* gpu_gate_f32 = metal_alloc(ffn_f32_bytes);           // [N, I] fp32 gate output
+    void* gpu_up_f32 = metal_alloc(ffn_f32_bytes);             // [N, I] fp32 up output
+    void* gpu_swiglu_f16 = metal_alloc((size_t)N * I * 2);    // [N, I] fp16 SwiGLU result for down_proj
+    void* gpu_down_f32 = metal_alloc(attn_f32_bytes);          // [N, H] fp32 down_proj output
+    // LM head buffers
+    void* gpu_lmh_f16 = metal_alloc((size_t)1 * H * 2);       // [1, H] fp16 last hidden
+    void* gpu_lmh_f32 = metal_alloc((size_t)1 * vocab_size_ * sizeof(float));  // [1, V] fp32
+
+    if (!gpu_act_f16 || !gpu_proj_f32 || !gpu_z_f32 || !gpu_a_f32 || !gpu_b_f32 ||
+        !gpu_oproj_f16 || !gpu_attn_f32 || !gpu_ffn_f16 || !gpu_gate_f32 || !gpu_up_f32 ||
+        !gpu_swiglu_f16 || !gpu_down_f32 || !gpu_lmh_f16 || !gpu_lmh_f32) {
+        fprintf(stderr, "[gpu_prefill] Failed to allocate activation buffers\n");
+        metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
+        metal_free(gpu_a_f32); metal_free(gpu_b_f32); metal_free(gpu_oproj_f16);
+        metal_free(gpu_attn_f32); metal_free(gpu_ffn_f16); metal_free(gpu_gate_f32);
+        metal_free(gpu_up_f32); metal_free(gpu_swiglu_f16); metal_free(gpu_down_f32);
+        metal_free(gpu_lmh_f16); metal_free(gpu_lmh_f32);
+        return prefill_cpu(session, token_ids, start_pos);
+    }
+
+    // Embedding lookup (CPU, from fp32 embed_tokens_)
+    for (int i = 0; i < N; i++) {
+        memcpy(X.data() + (size_t)i * H,
+               embed_tokens_ + (int64_t)token_ids[i] * H,
+               (size_t)H * sizeof(float));
+    }
+
+    double total_gemm_ms = 0, total_attn_ms = 0, total_ffn_ms = 0;
+    double delta_attn_ms = 0, full_attn_ms = 0;
+    double total_norm_ms = 0, total_conv_ms = 0, total_cvt_ms = 0;
+
+    for (int L = 0; L < num_layers_; L++) {
+        auto& gw = gpu_weights_[L];
+        const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
+        const int proj_rows = gw.first_proj_rows;
+
+        // 1. RMSNorm (CPU)
+        Timer norm_timer;
+        for (int i = 0; i < N; i++) {
+            rmsnorm(X_norm.data() + (size_t)i * H,
+                    X.data() + (size_t)i * H,
+                    layers_[L].input_layernorm, H, rms_eps_);
+        }
+        total_norm_ms += norm_timer.elapsed_ms();
+
+        // 2. Convert X_norm fp32 → fp16 into Metal buffer, dispatch GPU GEMMs
+        Timer cvt_timer;
+        {
+            uint16_t* dst = (uint16_t*)gpu_act_f16;
+            const float* src = X_norm.data();
+            f32_to_f16_bulk(dst, src, N * H);
+        }
+        total_cvt_ms += cvt_timer.elapsed_ms();
+
+        Timer gemm_timer;
+
+        // QKV projection: [N,H] @ [proj_rows,H]^T = [N,proj_rows]
+        metal_sgemm_f16(gpu_act_f16, gw.first_proj, gpu_proj_f32,
+                        N, proj_rows, H);
+
+        if (is_linear) {
+            // Z projection: [N,H] @ [lin_total_val_,H]^T = [N,lin_total_val_]
+            if (gw.first_proj_b) {
+                metal_sgemm_f16(gpu_act_f16, gw.first_proj_b, gpu_z_f32,
+                                N, gw.first_proj_b_rows, H);
+            }
+            // A projection: [N,H] @ [num_val_heads,H]^T = [N,num_val_heads]
+            metal_sgemm_f16(gpu_act_f16, gw.a_proj, gpu_a_f32,
+                            N, lin_num_val_heads_, H);
+            // B projection: [N,H] @ [num_val_heads,H]^T = [N,num_val_heads]
+            metal_sgemm_f16(gpu_act_f16, gw.b_proj, gpu_b_f32,
+                            N, lin_num_val_heads_, H);
+        }
+
+        metal_sync();
+        total_gemm_ms += gemm_timer.elapsed_ms();
+
+        // Copy GPU fp32 results back to CPU vectors
+        // Proj output: gpu_proj_f32 is [N, proj_rows] contiguous, but Proj is [N, max_proj]
+        {
+            const float* src = (const float*)gpu_proj_f32;
+            for (int i = 0; i < N; i++) {
+                memcpy(Proj.data() + (size_t)i * max_proj, src + (size_t)i * proj_rows,
+                       (size_t)proj_rows * sizeof(float));
+            }
+        }
+        if (is_linear) {
+            memcpy(Z_batch.data(), gpu_z_f32, (size_t)N * lin_total_val_ * sizeof(float));
+            memcpy(A_batch.data(), gpu_a_f32, (size_t)N * lin_num_val_heads_ * sizeof(float));
+            memcpy(B_batch.data(), gpu_b_f32, (size_t)N * lin_num_val_heads_ * sizeof(float));
+        }
+
+        // 3. Attention core (CPU — same as prefill_cpu)
+        Timer attn_timer;
+        if (is_linear) {
+            auto& dw = layers_[L].deltanet;
+            const int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+            const float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
+
+            // Phase 1: Sequential conv1d + silu
+            Timer conv_timer;
+            for (int i = 0; i < N; i++) {
+                float* mixed_qkv = Proj.data() + (size_t)i * max_proj;
+                float* conv_out_i = conv_batch.data() + (size_t)i * lin_qkv_dim_;
+                conv1d_update(conv_out_i, session.delta_conv_state[L], &session.delta_conv_pos[L],
+                              mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+                silu_vec_inplace(conv_out_i, lin_qkv_dim_, session.scratch_tmp);
+            }
+            total_conv_ms += conv_timer.elapsed_ms();
+
+            // Phase 2: Parallel across key heads
+            const int num_kh = lin_num_heads_;
+            const int key_dim = lin_key_dim_;
+            const int val_dim = lin_val_dim_;
+            const int total_key = lin_total_key_;
+            const int total_val = lin_total_val_;
+            const int num_vh = lin_num_val_heads_;
+            const int qkv_dim = lin_qkv_dim_;
+            float* conv_data = conv_batch.data();
+            float* y_data = Y_batch.data();
+            float* a_data = A_batch.data();
+            float* b_data = B_batch.data();
+            float* oproj_data = Oproj.data();
+            float* z_data = Z_batch.data();
+            float** ssm_states = session.delta_ssm_state.data();
+            const float* dw_A = dw.A;
+            const float* dw_dt_bias = dw.dt_bias;
+            const float* dw_norm_w = dw.norm_w;
+
+            dispatch_apply((size_t)num_kh, par_queue, ^(size_t kh_idx) {
+                int kh = (int)kh_idx;
+                for (int i = 0; i < N; i++) {
+                    float* conv_out_i = conv_data + (size_t)i * qkv_dim;
+                    float* qh = conv_out_i + kh * key_dim;
+                    float* kh_ptr = conv_out_i + total_key + kh * key_dim;
+
+                    l2_normalize(qh, key_dim);
+                    l2_normalize(kh_ptr, key_dim);
+                    float qs = q_scale;
+                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)key_dim);
+
+                    float* a_vec = a_data + (size_t)i * num_vh;
+                    float* b_vec = b_data + (size_t)i * num_vh;
+
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* vh_ptr = conv_out_i + total_key * 2 + vh * val_dim;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        float* state = ssm_states[L] + (size_t)vh * key_dim * val_dim;
+                        float beta = sigmoid_f(b_vec[vh]);
+                        float decay = expf(-dw_A[vh] * softplus_f(a_vec[vh] + dw_dt_bias[vh]));
+                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, key_dim, val_dim);
+                    }
+
+                    float* pre_oproj = oproj_data + (size_t)i * max_attn;
+                    float* z_ptr = z_data + (size_t)i * total_val;
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        rmsnorm_gated(pre_oproj + vh * val_dim,
+                                      yh,
+                                      z_ptr + vh * val_dim,
+                                      dw_norm_w, val_dim);
+                    }
+                }
+            });
+        } else {
+            // Full attention (CPU — identical to prefill_cpu)
+            auto& fw = layers_[L].full_attn;
+            const int hd = head_dim_;
+            const int nqh = num_q_heads_;
+            const int nkvh = num_kv_heads_;
+            const int groups = nqh / nkvh;
+            const float scale = 1.0f / sqrtf((float)hd);
+
+            for (int i = 0; i < N; i++) {
+                float* proj = Proj.data() + (size_t)i * max_proj;
+                float* q_gate_raw = proj;
+                float* k_raw = proj + full_q_dim_;
+                int pos = start_pos + i;
+
+                for (int h = 0; h < nqh; h++) {
+                    float* qh = q_gate_raw + (size_t)h * hd * 2;
+                    rmsnorm(qh, qh, fw.q_norm, hd, rms_eps_);
+                }
+                for (int h = 0; h < nkvh; h++) {
+                    rmsnorm(k_raw + h * hd, k_raw + h * hd, fw.k_norm, hd, rms_eps_);
+                }
+
+                const float* rope_cos_row = nullptr;
+                const float* rope_sin_row = nullptr;
+                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                    int half_rot = rot_dim_ / 2;
+                    rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+                    rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+                }
+                apply_rope_cached(q_gate_raw, k_raw, nqh, nkvh,
+                                  hd, hd * 2, hd, rot_dim_, pos, rope_theta_,
+                                  rope_cos_row, rope_sin_row);
+            }
+
+            const size_t kv_stride = (size_t)nkvh * hd;
+            for (int i = 0; i < N; i++) {
+                float* proj = Proj.data() + (size_t)i * max_proj;
+                float* k_raw = proj + full_q_dim_;
+                float* v_raw = proj + full_q_dim_ + full_kv_dim_;
+                memcpy(fullK.data() + (size_t)i * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(fullV.data() + (size_t)i * kv_stride, v_raw, kv_stride * sizeof(float));
+
+                int slot;
+                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                    slot = session.kv_start[L] + session.kv_len[L];
+                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    session.kv_len[L]++;
+                } else {
+                    slot = session.kv_start[L];
+                    session.kv_start[L]++;
+                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                }
+                memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+            }
+
+            // Pre-gather K, V into [nkvh, N, hd]
+            for (int kvh = 0; kvh < nkvh; kvh++) {
+                float* kb = fa_k_buf.data() + (size_t)kvh * N * hd;
+                float* vb = fa_v_buf.data() + (size_t)kvh * N * hd;
+                for (int i = 0; i < N; i++) {
+                    memcpy(kb + (size_t)i * hd, fullK.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                    memcpy(vb + (size_t)i * hd, fullV.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                }
+            }
+
+            float* proj_data = Proj.data();
+            float* oproj_data = Oproj.data();
+            const bool do_gate = attn_output_gate_;
+            const int total_q_heads = nqh;
+            float* fa_s = fa_scores.data();
+            float* fa_q = fa_q_buf.data();
+            float* fa_kb = fa_k_buf.data();
+            float* fa_vb = fa_v_buf.data();
+            float* fa_o = fa_out_buf.data();
+
+            dispatch_apply((size_t)total_q_heads, par_queue, ^(size_t h_idx) {
+                int h = (int)h_idx;
+                int kvh = h / groups;
+                const size_t NN = (size_t)N * N;
+                const size_t Nhd = (size_t)N * hd;
+
+                float* scores = fa_s + h * NN;
+                float* q_buf = fa_q + h * Nhd;
+                float* out_buf = fa_o + h * Nhd;
+                const float* k_buf = fa_kb + (size_t)kvh * Nhd;
+                const float* v_buf = fa_vb + (size_t)kvh * Nhd;
+
+                for (int i = 0; i < N; i++) {
+                    memcpy(q_buf + (size_t)i * hd,
+                           proj_data + (size_t)i * max_proj + (size_t)h * hd * 2,
+                           (size_t)hd * sizeof(float));
+                }
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            N, N, hd, scale,
+                            q_buf, hd, k_buf, hd,
+                            0.0f, scores, N);
+
+                for (int i = 0; i < N; i++) {
+                    float* row = scores + (size_t)i * N;
+                    for (int j = i + 1; j < N; j++) row[j] = -1e9f;
+                    softmax(row, N);
+                }
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            N, hd, N, 1.0f,
+                            scores, N, v_buf, hd,
+                            0.0f, out_buf, hd);
+
+                float tmp[256];
+                for (int i = 0; i < N; i++) {
+                    float* dst = oproj_data + (size_t)i * max_attn + (size_t)h * hd;
+                    float* src = out_buf + (size_t)i * hd;
+                    if (do_gate) {
+                        const float* gh = proj_data + (size_t)i * max_proj + (size_t)h * hd * 2 + hd;
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
+                        mul_sigmoid_inplace(dst, gh, hd, tmp);
+                    } else {
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
+                    }
+                }
+            });
+        }
+        double layer_attn = attn_timer.elapsed_ms();
+        total_attn_ms += layer_attn;
+        if (is_linear) delta_attn_ms += layer_attn;
+        else full_attn_ms += layer_attn;
+
+        // 4. O projection via GPU GEMM
+        Timer oproj_timer;
+        const int attn_dim = gw.o_proj_in;
+        {
+            // Convert Oproj fp32 → fp16 for GPU input
+            uint16_t* dst = (uint16_t*)gpu_oproj_f16;
+            const float* src = Oproj.data();
+            for (int i = 0; i < N; i++) {
+                for (int j = 0; j < attn_dim; j++) {
+                    ((__fp16*)dst)[(size_t)i * attn_dim + j] = (__fp16)src[(size_t)i * max_attn + j];
+                }
+            }
+        }
+        // O proj: [N, attn_dim] @ [H, attn_dim]^T = [N, H]
+        metal_sgemm_f16(gpu_oproj_f16, gw.o_proj, gpu_attn_f32,
+                        N, H, attn_dim);
+        metal_sync();
+
+        // Copy result and residual add
+        memcpy(Attn.data(), gpu_attn_f32, (size_t)N * H * sizeof(float));
+        vDSP_vadd(X.data(), 1, Attn.data(), 1, X.data(), 1, (vDSP_Length)(N * H));
+        total_gemm_ms += oproj_timer.elapsed_ms();
+
+        // 6. Post-attention RMSNorm (CPU)
+        norm_timer.reset();
+        for (int i = 0; i < N; i++) {
+            rmsnorm(X_norm.data() + (size_t)i * H,
+                    X.data() + (size_t)i * H,
+                    layers_[L].post_attention_layernorm, H, rms_eps_);
+        }
+        total_norm_ms += norm_timer.elapsed_ms();
+
+        // 7. FFN via GPU GEMM
+        Timer ffn_timer;
+        {
+            // Convert X_norm fp32 → fp16 for FFN input
+            uint16_t* dst = (uint16_t*)gpu_ffn_f16;
+            const float* src = X_norm.data();
+            f32_to_f16_bulk(dst, src, N * H);
+        }
+
+        // Gate: [N, H] @ [I, H]^T = [N, I]
+        metal_sgemm_f16(gpu_ffn_f16, gw.gate_proj, gpu_gate_f32,
+                        N, I, H);
+        // Up: [N, H] @ [I, H]^T = [N, I]
+        metal_sgemm_f16(gpu_ffn_f16, gw.up_proj, gpu_up_f32,
+                        N, I, H);
+        metal_sync();
+
+        // SwiGLU on CPU: silu(gate) * up → write fp16 result for down_proj
+        // Use Gate buffer as scratch (gpu_gate_f32 is shared memory, writable)
+        {
+            float* gp = (float*)gpu_gate_f32;
+            const float* up = (const float*)gpu_up_f32;
+            const int total = N * I;
+
+            // negate gate for sigmoid: -g
+            float neg = -1.0f;
+            vDSP_vsmul(gp, 1, &neg, Gate.data(), 1, (vDSP_Length)total);
+            // exp(-g)
+            int n = total;
+            vvexpf(Gate.data(), Gate.data(), &n);
+            // 1 + exp(-g)
+            float one = 1.0f;
+            vDSP_vsadd(Gate.data(), 1, &one, Gate.data(), 1, (vDSP_Length)total);
+            // gate / (1 + exp(-gate)) = silu(gate)
+            vDSP_vdiv(Gate.data(), 1, gp, 1, Gate.data(), 1, (vDSP_Length)total);
+            // silu(gate) * up
+            vDSP_vmul(Gate.data(), 1, up, 1, Gate.data(), 1, (vDSP_Length)total);
+            // Convert to fp16
+            f32_to_f16_bulk((uint16_t*)gpu_swiglu_f16, Gate.data(), total);
+        }
+
+        // Down: [N, I] @ [H, I]^T = [N, H]
+        metal_sgemm_f16(gpu_swiglu_f16, gw.down_proj, gpu_down_f32,
+                        N, H, I);
+        metal_sync();
+
+        // Residual add
+        {
+            const float* down = (const float*)gpu_down_f32;
+            float* x = X.data();
+            vDSP_vadd(x, 1, down, 1, x, 1, (vDSP_Length)(N * H));
+        }
+        total_ffn_ms += ffn_timer.elapsed_ms();
+    } // end layer loop
+
+    // Final norm + LM head via GPU
+    float* last_hidden = X.data() + (size_t)(N - 1) * H;
+    rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
+
+    // Convert last hidden to fp16 for GPU lm_head GEMM
+    {
+        uint16_t* dst = (uint16_t*)gpu_lmh_f16;
+        f32_to_f16_bulk(dst, session.x, H);
+    }
+    // LM head: [1, H] @ [V, H]^T = [1, V]
+    metal_sgemm_f16(gpu_lmh_f16, gpu_lm_head_, gpu_lmh_f32,
+                    1, vocab_size_, H);
+    metal_sync();
+    memcpy(session.logits, gpu_lmh_f32, (size_t)vocab_size_ * sizeof(float));
+
+    // Free activation buffers
+    metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
+    metal_free(gpu_a_f32); metal_free(gpu_b_f32); metal_free(gpu_oproj_f16);
+    metal_free(gpu_attn_f32); metal_free(gpu_ffn_f16); metal_free(gpu_gate_f32);
+    metal_free(gpu_up_f32); metal_free(gpu_swiglu_f16); metal_free(gpu_down_f32);
+    metal_free(gpu_lmh_f16); metal_free(gpu_lmh_f32);
+
+    double elapsed = total_timer.elapsed_ms();
+    fprintf(stderr, "[gpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms (delta=%.0f[conv=%.0f] full=%.0f) ffn=%.0fms norm=%.0fms cvt=%.0fms\n",
+            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, delta_attn_ms, total_conv_ms, full_attn_ms, total_ffn_ms, total_norm_ms, total_cvt_ms);
+
+    return session.logits;
+}
+
 
 bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch) {
     if (!sessions || !token_ids || !positions || batch <= 0) return false;
