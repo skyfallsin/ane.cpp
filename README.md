@@ -64,6 +64,9 @@ cmake --build build
 # Interactive chat
 ./build/ane.cpp chat --model /path/to/Qwen3-4B
 
+# OpenAI-compatible API server
+./build/ane.cpp serve --model /path/to/Qwen3.5-4B --port 8088 --sessions 4
+
 # Pre-convert weights (BF16 -> FP16, speeds up subsequent loads)
 ./build/ane.cpp convert --model /path/to/Qwen3-4B
 ```
@@ -86,6 +89,62 @@ HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download Qwen/Qwen3.5-9B --local-dir
 
 These commands create local model directories such as `./Qwen3-4B`, which can then be used directly with `--model ./Qwen3-4B`.
 
+### Serve mode
+
+`serve` starts an OpenAI-compatible HTTP server at `http://127.0.0.1:<port>/v1`. It implements:
+
+- `POST /v1/chat/completions` — streaming (SSE) and non-streaming responses
+- `GET /v1/models` — lists the loaded model
+
+```bash
+./build/ane.cpp serve --model /path/to/Qwen3.5-4B --port 8088 --sessions 4
+
+# Non-streaming
+curl http://localhost:8088/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": false, "max_tokens": 100}'
+
+# Streaming (default)
+curl -N http://localhost:8088/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+```
+
+Supported request fields: `messages`, `stream`, `max_tokens`, `temperature`, `top_p`, `top_k`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `enable_thinking`, `chat_template_kwargs.enable_thinking`.
+
+**Use with [pi](https://github.com/badlogic/pi)** — add to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "ane": {
+      "baseUrl": "http://localhost:8088/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "maxTokensField": "max_tokens",
+        "thinkingFormat": "qwen-chat-template"
+      },
+      "models": [
+        {
+          "id": "Qwen3.5-4B",
+          "name": "Qwen 3.5 4B (ANE)",
+          "reasoning": true,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}
+```
+
+Then select it with `/model` in pi.
+
 ### Options
 
 ```text
@@ -95,6 +154,8 @@ These commands create local model directories such as `./Qwen3-4B`, which can th
 --temp T             Temperature (default: 0.6)
 --repeat-penalty P   Repetition penalty (default: 1.2, 1.0=off)
 --enable-thinking    Enable thinking/reasoning mode
+--port N             Server port for serve mode (default: 8088)
+--sessions N         Session pool size for serve mode (default: 4)
 --no-ane-cache       Disable persistent ANE compile cache
 -v, --verbose        Show detailed initialization info
 ```

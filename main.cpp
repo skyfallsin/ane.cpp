@@ -13,6 +13,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <atomic>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -128,39 +129,140 @@ static std::string format_prompt(Tokenizer& tokenizer, const std::string& prompt
     return prompt + "\n";
 }
 
-static std::string read_line_fd(int fd) {
-    std::string line;
-    char ch = 0;
-    while (true) {
-        ssize_t n = recv(fd, &ch, 1, 0);
-        if (n <= 0) break;
-        if (ch == '\n') break;
-        line.push_back(ch);
-        if (line.size() > (1u << 20)) break;
-    }
-    return line;
+
+// =====================================================
+// HTTP helpers for OpenAI-compatible serve mode
+// =====================================================
+
+static std::string generate_request_id() {
+    static std::atomic<int> counter{0};
+    int c = counter.fetch_add(1);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "chatcmpl-ane-%d-%d", (int)time(nullptr), c);
+    return buf;
 }
 
-static void write_json_line(int fd, const nlohmann::json& payload) {
-    std::string line = payload.dump();
-    line.push_back('\n');
-    const char* data = line.c_str();
-    size_t left = line.size();
+static std::string extract_model_name(const char* model_dir) {
+    std::string path(model_dir);
+    while (!path.empty() && path.back() == '/') path.pop_back();
+    auto pos = path.rfind('/');
+    if (pos != std::string::npos) return path.substr(pos + 1);
+    return path;
+}
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string body;
+    bool valid = false;
+};
+
+static HttpRequest parse_http_request(int fd) {
+    HttpRequest req;
+    std::string hdr;
+    // Read until \r\n\r\n
+    while (hdr.size() < 65536) {
+        char ch;
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n <= 0) return req;
+        hdr.push_back(ch);
+        if (hdr.size() >= 4 &&
+            hdr[hdr.size()-4] == '\r' && hdr[hdr.size()-3] == '\n' &&
+            hdr[hdr.size()-2] == '\r' && hdr[hdr.size()-1] == '\n') break;
+    }
+
+    // Parse request line: "POST /v1/chat/completions HTTP/1.1\r\n"
+    auto first_crlf = hdr.find("\r\n");
+    if (first_crlf == std::string::npos) return req;
+    std::string request_line = hdr.substr(0, first_crlf);
+    auto sp1 = request_line.find(' ');
+    if (sp1 == std::string::npos) return req;
+    auto sp2 = request_line.find(' ', sp1 + 1);
+    if (sp2 == std::string::npos) return req;
+    req.method = request_line.substr(0, sp1);
+    req.path = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
+
+    // Find Content-Length (case-insensitive)
+    int content_length = 0;
+    std::string hdr_lower = hdr;
+    for (auto& c : hdr_lower) c = (char)tolower((unsigned char)c);
+    auto cl_pos = hdr_lower.find("content-length:");
+    if (cl_pos != std::string::npos) {
+        content_length = atoi(hdr.c_str() + cl_pos + 15);
+    }
+
+    // Read body
+    if (content_length > 0 && content_length < (1 << 20)) {
+        req.body.resize((size_t)content_length);
+        size_t got = 0;
+        while (got < (size_t)content_length) {
+            ssize_t r = recv(fd, &req.body[got], (size_t)content_length - got, 0);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        req.body.resize(got);
+    }
+
+    req.valid = true;
+    return req;
+}
+
+static void send_raw(int fd, const std::string& data) {
+    const char* p = data.c_str();
+    size_t left = data.size();
     while (left > 0) {
-        ssize_t n = send(fd, data, left, 0);
+        ssize_t n = send(fd, p, left, 0);
         if (n <= 0) break;
-        data += n;
+        p += n;
         left -= (size_t)n;
     }
 }
 
+static void send_http_json(int fd, int status, const char* status_text,
+                           const std::string& body) {
+    std::string resp = "HTTP/1.1 " + std::to_string(status) + " " + status_text + "\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+    send_raw(fd, resp);
+}
+
+static void send_sse_headers(int fd) {
+    send_raw(fd, "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n");
+}
+
+static void send_sse_event(int fd, const nlohmann::json& data) {
+    std::string event = "data: " + data.dump() + "\n\n";
+    send_raw(fd, event);
+}
+
+static void send_sse_done(int fd) {
+    send_raw(fd, "data: [DONE]\n\n");
+}
+
+// =====================================================
+// OpenAI-compatible ServeRequest
+// =====================================================
+
 struct ServeRequest {
     int client_fd = -1;
-    int id = 0;
-    std::string prompt;
+    std::string request_id;
+    std::string model_name;
+    std::vector<std::pair<std::string, std::string>> messages;
     int max_tokens = 0;
     bool enable_thinking = false;
+    bool stream = true;
     SamplingParams sampling = {};
+    int64_t created = 0;
+
+    // Session & generation state
     std::unique_ptr<Qwen35Model::Session> session;
     std::vector<int> prompt_tokens;
     std::vector<int> generated_tokens;
@@ -170,24 +272,193 @@ struct ServeRequest {
     double prompt_tps = 0.0;
     Timer generation_timer;
     bool generation_timer_started = false;
+
+    // Incremental text decode state (for streaming)
+    std::string prev_decoded;
+    std::string emitted_text;
+    bool has_prev_decoded = false;
+    bool sse_headers_sent = false;
+    bool role_sent = false;
 };
 
-static void finish_request(Tokenizer& tokenizer, ServeRequest& req, const char* error = nullptr) {
-    nlohmann::json out;
-    out["id"] = req.id;
-    out["ok"] = (error == nullptr);
-    if (error) {
-        out["error"] = error;
-    } else {
-        out["text"] = tokenizer.decode(req.generated_tokens);
-        out["prompt_tokens"] = req.prompt_token_count;
-        out["prompt_tps"] = req.prompt_tps;
-        out["generation_tokens"] = (int)req.generated_tokens.size();
-        out["generation_tps"] = req.generated_tokens.empty()
-            ? 0.0
-            : req.generated_tokens.size() / (req.generation_timer.elapsed_ms() / 1000.0);
+static bool is_utf8_continuation(uint8_t b) {
+    return (b & 0xC0u) == 0x80u;
+}
+
+// Emit one token to client (streaming or accumulate for non-streaming)
+static void emit_token_to_client(Tokenizer& tokenizer, ServeRequest& req, int token) {
+    req.generated_tokens.push_back(token);
+    std::string current_decoded = tokenizer.decode(req.generated_tokens);
+
+    std::string piece;
+    if (req.has_prev_decoded) {
+        // Find stable prefix between prev and current decode
+        size_t lcp = std::min(req.prev_decoded.size(), current_decoded.size());
+        size_t i = 0;
+        while (i < lcp && req.prev_decoded[i] == current_decoded[i]) i++;
+        // Back up to UTF-8 boundary
+        while (i > 0 && is_utf8_continuation((uint8_t)req.prev_decoded[i])) i--;
+        std::string stable = req.prev_decoded.substr(0, i);
+        if (stable.size() >= req.emitted_text.size() &&
+            stable.compare(0, req.emitted_text.size(), req.emitted_text) == 0) {
+            piece = stable.substr(req.emitted_text.size());
+            req.emitted_text = std::move(stable);
+        }
     }
-    write_json_line(req.client_fd, out);
+    req.prev_decoded = std::move(current_decoded);
+    req.has_prev_decoded = true;
+
+    if (req.stream && !piece.empty()) {
+        if (!req.sse_headers_sent) {
+            send_sse_headers(req.client_fd);
+            req.sse_headers_sent = true;
+        }
+        // Send role delta on first content
+        if (!req.role_sent) {
+            nlohmann::json role_chunk = {
+                {"id", req.request_id},
+                {"object", "chat.completion.chunk"},
+                {"created", req.created},
+                {"model", req.model_name},
+                {"choices", {{
+                    {"index", 0},
+                    {"delta", {{"role", "assistant"}}},
+                    {"finish_reason", nullptr}
+                }}}
+            };
+            send_sse_event(req.client_fd, role_chunk);
+            req.role_sent = true;
+        }
+        nlohmann::json chunk = {
+            {"id", req.request_id},
+            {"object", "chat.completion.chunk"},
+            {"created", req.created},
+            {"model", req.model_name},
+            {"choices", {{
+                {"index", 0},
+                {"delta", {{"content", piece}}},
+                {"finish_reason", nullptr}
+            }}}
+        };
+        send_sse_event(req.client_fd, chunk);
+    }
+}
+
+// Flush remaining decoded text (BPE can buffer partial codepoints)
+static void flush_remaining_text(ServeRequest& req) {
+    if (!req.has_prev_decoded) return;
+    std::string tail;
+    if (req.prev_decoded.size() > req.emitted_text.size() &&
+        req.prev_decoded.compare(0, req.emitted_text.size(), req.emitted_text) == 0) {
+        tail = req.prev_decoded.substr(req.emitted_text.size());
+    }
+    if (req.stream && !tail.empty()) {
+        if (!req.sse_headers_sent) {
+            send_sse_headers(req.client_fd);
+            req.sse_headers_sent = true;
+        }
+        if (!req.role_sent) {
+            nlohmann::json role_chunk = {
+                {"id", req.request_id},
+                {"object", "chat.completion.chunk"},
+                {"created", req.created},
+                {"model", req.model_name},
+                {"choices", {{
+                    {"index", 0},
+                    {"delta", {{"role", "assistant"}}},
+                    {"finish_reason", nullptr}
+                }}}
+            };
+            send_sse_event(req.client_fd, role_chunk);
+            req.role_sent = true;
+        }
+        nlohmann::json chunk = {
+            {"id", req.request_id},
+            {"object", "chat.completion.chunk"},
+            {"created", req.created},
+            {"model", req.model_name},
+            {"choices", {{
+                {"index", 0},
+                {"delta", {{"content", tail}}},
+                {"finish_reason", nullptr}
+            }}}
+        };
+        send_sse_event(req.client_fd, chunk);
+    }
+    req.emitted_text = req.prev_decoded;
+}
+
+static void finish_request(Tokenizer& tokenizer, ServeRequest& req, const char* error = nullptr) {
+    double gen_tps = req.generated_tokens.empty()
+        ? 0.0
+        : req.generated_tokens.size() / (req.generation_timer.elapsed_ms() / 1000.0);
+
+    if (error) {
+        if (req.stream && req.sse_headers_sent) {
+            // Error mid-stream: send error event and close
+            nlohmann::json err_chunk = {
+                {"error", {{"message", error}, {"type", "server_error"}}}
+            };
+            send_sse_event(req.client_fd, err_chunk);
+            send_sse_done(req.client_fd);
+        } else {
+            nlohmann::json err_resp = {
+                {"error", {{"message", error}, {"type", "server_error"}, {"code", 500}}}
+            };
+            send_http_json(req.client_fd, 500, "Internal Server Error", err_resp.dump());
+        }
+    } else if (req.stream) {
+        flush_remaining_text(req);
+        if (!req.sse_headers_sent) {
+            send_sse_headers(req.client_fd);
+            req.sse_headers_sent = true;
+        }
+        // Final chunk with finish_reason
+        nlohmann::json final_chunk = {
+            {"id", req.request_id},
+            {"object", "chat.completion.chunk"},
+            {"created", req.created},
+            {"model", req.model_name},
+            {"choices", {{
+                {"index", 0},
+                {"delta", nlohmann::json::object()},
+                {"finish_reason", "stop"}
+            }}},
+            {"usage", {
+                {"prompt_tokens", req.prompt_token_count},
+                {"completion_tokens", (int)req.generated_tokens.size()},
+                {"total_tokens", req.prompt_token_count + (int)req.generated_tokens.size()}
+            }}
+        };
+        send_sse_event(req.client_fd, final_chunk);
+        send_sse_done(req.client_fd);
+    } else {
+        // Non-streaming: send complete response
+        std::string full_text = req.generated_tokens.empty()
+            ? "" : tokenizer.decode(req.generated_tokens);
+        nlohmann::json resp = {
+            {"id", req.request_id},
+            {"object", "chat.completion"},
+            {"created", req.created},
+            {"model", req.model_name},
+            {"choices", {{
+                {"index", 0},
+                {"message", {{"role", "assistant"}, {"content", full_text}}},
+                {"finish_reason", "stop"}
+            }}},
+            {"usage", {
+                {"prompt_tokens", req.prompt_token_count},
+                {"completion_tokens", (int)req.generated_tokens.size()},
+                {"total_tokens", req.prompt_token_count + (int)req.generated_tokens.size()}
+            }}
+        };
+        send_http_json(req.client_fd, 200, "OK", resp.dump());
+    }
+
+    fprintf(stderr, "[%s] %d prompt (%.1f t/s) + %d gen (%.1f t/s)\n",
+            req.request_id.c_str(), req.prompt_token_count, req.prompt_tps,
+            (int)req.generated_tokens.size(), gen_tps);
+
     close(req.client_fd);
     req.client_fd = -1;
 }
@@ -203,6 +474,9 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
     }
 
     signal(SIGPIPE, SIG_IGN);
+
+    std::string model_name = extract_model_name(args.model_dir);
+    int64_t server_created = (int64_t)time(nullptr);
 
     std::mutex mu;
     std::condition_variable cv;
@@ -242,8 +516,10 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
         return 1;
     }
 
-    fprintf(stderr, "ane.cpp serve listening on 127.0.0.1:%d with %d sessions\n", args.port, args.sessions);
+    fprintf(stderr, "ane.cpp serve: OpenAI-compatible API at http://127.0.0.1:%d/v1\n", args.port);
+    fprintf(stderr, "  model: %s, sessions: %d\n", model_name.c_str(), args.sessions);
 
+    // Scheduler thread — batched decode with per-token streaming
     std::thread scheduler([&] {
         while (true) {
             std::unique_lock<std::mutex> lock(mu);
@@ -272,7 +548,17 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
 
             for (auto& req : batch) {
                 if (!req->logits) {
-                    std::string formatted = format_prompt(tokenizer, req->prompt, req->enable_thinking);
+                    // Prefill: apply chat template to messages
+                    std::string formatted;
+                    if (tokenizer.has_chat_template()) {
+                        formatted = tokenizer.apply_chat_template(
+                            req->messages, true, req->enable_thinking);
+                    } else {
+                        for (auto& [role, content] : req->messages) {
+                            (void)role;
+                            formatted += content + "\n";
+                        }
+                    }
                     req->prompt_tokens = tokenizer.encode(formatted);
                     req->prompt_token_count = (int)req->prompt_tokens.size();
                     req->sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
@@ -298,14 +584,17 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                         req->generation_timer.reset();
                         req->generation_timer_started = true;
                     }
-                    int next_token = sample_token(req->logits, req->sampler_vocab, req->sampling, req->generated_tokens);
+                    int next_token = sample_token(req->logits, req->sampler_vocab,
+                                                  req->sampling, req->generated_tokens);
                     if (is_stop_token(next_token, tokenizer)) {
                         done = true;
                     } else {
-                        req->generated_tokens.push_back(next_token);
+                        emit_token_to_client(tokenizer, *req, next_token);
                         if ((int)req->generated_tokens.size() < limit) {
                             decode_tokens.push_back(next_token);
-                            decode_positions.push_back(req->prompt_token_count + (int)req->generated_tokens.size() - 1);
+                            decode_positions.push_back(
+                                req->prompt_token_count +
+                                (int)req->generated_tokens.size() - 1);
                         } else {
                             done = true;
                         }
@@ -325,20 +614,26 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                 bool decode_ok = true;
                 if (next_active.size() == 1) {
                     auto& req = next_active[0];
-                    req->logits = model.forward(*req->session, decode_tokens[0], decode_positions[0]);
+                    req->logits = model.forward(*req->session,
+                                                decode_tokens[0], decode_positions[0]);
                     decode_ok = (req->logits != nullptr);
                 } else {
                     std::vector<Qwen35Model::Session*> sessions;
                     sessions.reserve(next_active.size());
-                    for (auto& req : next_active) sessions.push_back(req->session.get());
-                    decode_ok = model.forward_batch(sessions.data(), decode_tokens.data(), decode_positions.data(), (int)next_active.size());
+                    for (auto& req : next_active)
+                        sessions.push_back(req->session.get());
+                    decode_ok = model.forward_batch(
+                        sessions.data(), decode_tokens.data(),
+                        decode_positions.data(), (int)next_active.size());
                     if (decode_ok) {
-                        for (auto& req : next_active) req->logits = req->session->logits;
+                        for (auto& req : next_active)
+                            req->logits = req->session->logits;
                     } else {
                         fprintf(stderr, "Batched decode failed, falling back to sequential\n");
                         for (size_t i = 0; i < next_active.size(); i++) {
                             auto& req = next_active[i];
-                            req->logits = model.forward(*req->session, decode_tokens[i], decode_positions[i]);
+                            req->logits = model.forward(*req->session,
+                                                        decode_tokens[i], decode_positions[i]);
                             if (!req->logits) {
                                 finish_request(tokenizer, *req, "generation failed");
                                 std::lock_guard<std::mutex> done_lock(mu);
@@ -365,6 +660,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
     });
     scheduler.detach();
 
+    // Accept loop — parse HTTP requests and route
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) {
@@ -372,37 +668,128 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
             continue;
         }
 
-        std::string line = read_line_fd(client_fd);
-        if (line.empty()) {
+        std::thread([client_fd, &mu, &cv, &pending, &args, &model_name,
+                     server_created] {
+            HttpRequest http = parse_http_request(client_fd);
+            if (!http.valid) {
+                close(client_fd);
+                return;
+            }
+
+            // CORS preflight
+            if (http.method == "OPTIONS") {
+                send_raw(client_fd, "HTTP/1.1 204 No Content\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                    "Access-Control-Max-Age: 86400\r\n"
+                    "Connection: close\r\n\r\n");
+                close(client_fd);
+                return;
+            }
+
+            // GET /v1/models
+            if (http.method == "GET" && http.path == "/v1/models") {
+                nlohmann::json resp = {
+                    {"object", "list"},
+                    {"data", {{
+                        {"id", model_name},
+                        {"object", "model"},
+                        {"created", server_created},
+                        {"owned_by", "ane.cpp"}
+                    }}}
+                };
+                send_http_json(client_fd, 200, "OK", resp.dump());
+                close(client_fd);
+                return;
+            }
+
+            // POST /v1/chat/completions
+            if (http.method == "POST" && http.path == "/v1/chat/completions") {
+                auto body = nlohmann::json::parse(http.body, nullptr, false);
+                if (body.is_discarded() || !body.contains("messages")) {
+                    nlohmann::json err = {
+                        {"error", {{"message", "Invalid request: 'messages' required"},
+                                   {"type", "invalid_request_error"}}}
+                    };
+                    send_http_json(client_fd, 400, "Bad Request", err.dump());
+                    close(client_fd);
+                    return;
+                }
+
+                auto req = std::make_unique<ServeRequest>();
+                req->client_fd = client_fd;
+                req->request_id = generate_request_id();
+                req->model_name = model_name;
+                req->created = (int64_t)time(nullptr);
+                req->stream = body.value("stream", true);
+
+                // Parse messages — content can be string or array of content blocks
+                for (auto& msg : body["messages"]) {
+                    std::string role = msg.value("role", "user");
+                    std::string content;
+                    if (msg.contains("content")) {
+                        if (msg["content"].is_string()) {
+                            content = msg["content"].get<std::string>();
+                        } else if (msg["content"].is_array()) {
+                            // OpenAI multi-modal format: [{"type":"text","text":"..."},...]
+                            for (auto& part : msg["content"]) {
+                                if (part.is_object() && part.value("type", "") == "text") {
+                                    if (!content.empty()) content += "\n";
+                                    content += part.value("text", "");
+                                }
+                            }
+                        }
+                    }
+                    // Map "developer" -> "system" for compatibility
+                    if (role == "developer") role = "system";
+                    req->messages.emplace_back(std::move(role), std::move(content));
+                }
+
+                // Sampling parameters
+                req->max_tokens = body.value("max_tokens",
+                                  body.value("max_completion_tokens", args.max_tokens));
+                req->sampling.temperature = body.value("temperature", args.temperature);
+                req->sampling.top_p = body.value("top_p", args.top_p);
+                req->sampling.presence_penalty = body.value("presence_penalty",
+                                                            args.presence_penalty);
+                req->sampling.frequency_penalty = body.value("frequency_penalty",
+                                                             args.frequency_penalty);
+                req->sampling.repetition_penalty = body.value("repetition_penalty",
+                                                              args.repetition_penalty);
+                if (body.contains("top_k")) {
+                    req->sampling.top_k = body.value("top_k", args.top_k);
+                } else {
+                    req->sampling.top_k = args.top_k;
+                }
+
+                // Enable thinking: check multiple conventions
+                req->enable_thinking = args.enable_thinking;
+                if (body.contains("enable_thinking")) {
+                    req->enable_thinking = body.value("enable_thinking", false);
+                } else if (body.contains("chat_template_kwargs")) {
+                    auto& kwargs = body["chat_template_kwargs"];
+                    if (kwargs.contains("enable_thinking")) {
+                        req->enable_thinking = kwargs.value("enable_thinking", false);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    pending.push_back(std::move(req));
+                }
+                cv.notify_all();
+                return;
+            }
+
+            // 404 for everything else
+            nlohmann::json err = {
+                {"error", {{"message", "Not found: " + http.path},
+                           {"type", "invalid_request_error"}}}
+            };
+            send_http_json(client_fd, 404, "Not Found", err.dump());
             close(client_fd);
-            continue;
-        }
-
-        nlohmann::json in = nlohmann::json::parse(line, nullptr, false);
-        if (in.is_discarded() || !in.contains("prompt") || !in["prompt"].is_string()) {
-            write_json_line(client_fd, {{"ok", false}, {"error", "invalid request"}});
-            close(client_fd);
-            continue;
-        }
-
-        auto req = std::make_unique<ServeRequest>();
-        req->client_fd = client_fd;
-        req->id = in.value("id", 0);
-        req->prompt = in.value("prompt", std::string());
-        req->max_tokens = in.value("max_tokens", args.max_tokens);
-        req->enable_thinking = in.value("enable_thinking", args.enable_thinking);
-        req->sampling.temperature = in.value("temp", args.temperature);
-        req->sampling.repetition_penalty = in.value("repeat_penalty", args.repetition_penalty);
-        req->sampling.presence_penalty = in.value("presence_penalty", args.presence_penalty);
-        req->sampling.frequency_penalty = in.value("frequency_penalty", args.frequency_penalty);
-        req->sampling.top_k = in.value("top_k", args.top_k);
-        req->sampling.top_p = in.value("top_p", args.top_p);
-
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            pending.push_back(std::move(req));
-        }
-        cv.notify_all();
+        }).detach();
     }
 
     close(server_fd);
