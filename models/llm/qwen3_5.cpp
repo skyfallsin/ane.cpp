@@ -1279,9 +1279,6 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
     std::vector<float> fullK((size_t)N * full_kv_dim_);
     std::vector<float> fullV((size_t)N * full_kv_dim_);
 
-    // Merged gate+up weight (allocated once, populated per layer)
-    std::vector<float> GateUp((size_t)N * 2 * I);
-
     dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
 
     // Embedding lookup
@@ -1496,83 +1493,79 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
             //
             // We compute Q@K^T as sgemm, then apply causal mask + softmax + sgemm for output.
 
-            // Allocate score matrix [N, N] and gather buffers per head
-            std::vector<float> scores((size_t)N * N);
-            std::vector<float> q_head_buf((size_t)N * hd);  // gathered Q for one head
+            // Parallel across all Q heads: each head does gather, Q@K^T, softmax, scores@V, scatter
+            // 16 Q heads with 4 KV groups → 4 Q heads share each K/V
+            // Per-thread: allocate scores[N,N], q_buf[N,hd], out[N,hd] on heap
+            const int total_q_heads = nqh;
+            const float* fK = fullK.data();
+            const float* fV = fullV.data();
+            float* proj_data = Proj.data();
+            float* oproj_data = Oproj.data();
+            const bool do_gate = attn_output_gate_;
 
-            for (int kvh = 0; kvh < nkvh; kvh++) {
-                // K for this KV head: fullK[:, kvh*hd : (kvh+1)*hd]
-                // Laid out with stride kv_stride between rows. Need contiguous [N, hd].
-                // Gather K into temp buffer
-                std::vector<float> k_head_buf((size_t)N * hd);
-                std::vector<float> v_head_buf((size_t)N * hd);
+            dispatch_apply((size_t)total_q_heads, par_queue, ^(size_t h_idx) {
+                int h = (int)h_idx;
+                int kvh = h / groups;
+
+                // Thread-local buffers
+                std::vector<float> scores((size_t)N * N);
+                std::vector<float> q_buf((size_t)N * hd);
+                std::vector<float> k_buf((size_t)N * hd);
+                std::vector<float> v_buf((size_t)N * hd);
+                std::vector<float> out_buf((size_t)N * hd);
+
+                // Gather K, V for this KV head
                 for (int i = 0; i < N; i++) {
-                    memcpy(k_head_buf.data() + (size_t)i * hd,
-                           fullK.data() + (size_t)i * kv_stride + kvh * hd,
+                    memcpy(k_buf.data() + (size_t)i * hd,
+                           fK + (size_t)i * kv_stride + kvh * hd,
                            (size_t)hd * sizeof(float));
-                    memcpy(v_head_buf.data() + (size_t)i * hd,
-                           fullV.data() + (size_t)i * kv_stride + kvh * hd,
+                    memcpy(v_buf.data() + (size_t)i * hd,
+                           fV + (size_t)i * kv_stride + kvh * hd,
                            (size_t)hd * sizeof(float));
                 }
 
-                for (int g = 0; g < groups; g++) {
-                    int h = kvh * groups + g;
-                    // Gather Q for head h: Proj[i*max_proj + h*hd*2], take first hd floats (skip gate)
-                    for (int i = 0; i < N; i++) {
-                        memcpy(q_head_buf.data() + (size_t)i * hd,
-                               Proj.data() + (size_t)i * max_proj + (size_t)h * hd * 2,
-                               (size_t)hd * sizeof(float));
-                    }
-
-                    // scores = scale * Q @ K^T : [N, hd] × [hd, N] → [N, N]
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                                N, N, hd, scale,
-                                q_head_buf.data(), hd,
-                                k_head_buf.data(), hd,
-                                0.0f, scores.data(), N);
-
-                    // Apply causal mask + softmax per row
-                    for (int i = 0; i < N; i++) {
-                        float* row = scores.data() + (size_t)i * N;
-                        // Mask: set positions j > i to -inf
-                        for (int j = i + 1; j < N; j++) row[j] = -1e9f;
-                        softmax(row, N);
-                    }
-
-                    // out = scores @ V : [N, N] × [N, hd] → [N, hd]
-                    // Write directly into Oproj at the right head offset
-                    // Oproj layout: token i → Oproj[i*max_attn + h*hd]
-                    // But max_attn stride means we need a temp then scatter
-                    std::vector<float> out_head((size_t)N * hd);
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                                N, hd, N, 1.0f,
-                                scores.data(), N,
-                                v_head_buf.data(), hd,
-                                0.0f, out_head.data(), hd);
-
-                    // Scatter output into Oproj
-                    for (int i = 0; i < N; i++) {
-                        memcpy(Oproj.data() + (size_t)i * max_attn + (size_t)h * hd,
-                               out_head.data() + (size_t)i * hd,
-                               (size_t)hd * sizeof(float));
-                    }
-                }
-            }
-
-            // Step 4: Output gating
-            if (attn_output_gate_) {
+                // Gather Q for this head
                 for (int i = 0; i < N; i++) {
-                    float* pre_oproj = Oproj.data() + (size_t)i * max_attn;
-                    float* q_gate_raw = Proj.data() + (size_t)i * max_proj;
-                    // Use a stack-allocated tmp for sigmoid
-                    float tmp[256];  // head_dim_ = 256
-                    for (int h = 0; h < nqh; h++) {
-                        float* oh = pre_oproj + h * hd;
-                        const float* gh = q_gate_raw + (size_t)h * hd * 2 + hd;
-                        mul_sigmoid_inplace(oh, gh, hd, tmp);
+                    memcpy(q_buf.data() + (size_t)i * hd,
+                           proj_data + (size_t)i * max_proj + (size_t)h * hd * 2,
+                           (size_t)hd * sizeof(float));
+                }
+
+                // scores = scale * Q @ K^T : [N, hd] × [hd, N] → [N, N]
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            N, N, hd, scale,
+                            q_buf.data(), hd,
+                            k_buf.data(), hd,
+                            0.0f, scores.data(), N);
+
+                // Causal mask + softmax
+                for (int i = 0; i < N; i++) {
+                    float* row = scores.data() + (size_t)i * N;
+                    for (int j = i + 1; j < N; j++) row[j] = -1e9f;
+                    softmax(row, N);
+                }
+
+                // out = scores @ V : [N, N] × [N, hd] → [N, hd]
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            N, hd, N, 1.0f,
+                            scores.data(), N,
+                            v_buf.data(), hd,
+                            0.0f, out_buf.data(), hd);
+
+                // Output gating + scatter into Oproj
+                float tmp[256];
+                for (int i = 0; i < N; i++) {
+                    float* dst = oproj_data + (size_t)i * max_attn + (size_t)h * hd;
+                    float* src = out_buf.data() + (size_t)i * hd;
+                    if (do_gate) {
+                        const float* gh = proj_data + (size_t)i * max_proj + (size_t)h * hd * 2 + hd;
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
+                        mul_sigmoid_inplace(dst, gh, hd, tmp);
+                    } else {
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
                     }
                 }
-            }
+            });
         }
         double layer_attn = attn_timer.elapsed_ms();
         total_attn_ms += layer_attn;
