@@ -40,12 +40,16 @@ public:
     // Returns number of blobs written, or -1 on error.
     static int write_ane_blobs(const SafeTensors& src, const std::string& output_dir);
 
-    // Load helpers
+    // Load helpers (allocate + convert)
     float* load_bf16_to_f32(const char* name, int64_t expected_numel = -1) const;
     uint16_t* load_bf16_to_f16(const char* name, int64_t expected_numel = -1) const;
     float* load_f32_direct(const char* name, int64_t expected_numel = -1) const;
     float* load_norm_weight(const char* name, int64_t expected_numel) const;
     const uint16_t* get_bf16_ptr(const char* name) const;
+
+    // Direct-to-buffer conversion helpers (no temp alloc)
+    bool convert_bf16_to_f16_into(uint16_t* dst, const char* name, int64_t expected_numel = -1) const;
+    bool convert_bf16_to_f32_into(float* dst, const char* name, int64_t expected_numel = -1) const;
 
 private:
     int fd_ = -1;

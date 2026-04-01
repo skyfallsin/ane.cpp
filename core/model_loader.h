@@ -21,6 +21,10 @@ public:
     float* load_f32_direct(const char* name, int64_t expected_numel = -1) const;
     float* load_norm_weight(const char* name, int64_t expected_numel) const;
 
+    // Direct-to-buffer conversion (no temp alloc)
+    bool convert_bf16_to_f16_into(uint16_t* dst, const char* name, int64_t expected_numel = -1) const;
+    bool convert_bf16_to_f32_into(float* dst, const char* name, int64_t expected_numel = -1) const;
+
     int write_ane_blobs(const std::string& output_dir) const;
 
     int shard_count() const { return (int)shards_.size(); }

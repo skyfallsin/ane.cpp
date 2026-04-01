@@ -328,6 +328,38 @@ const uint16_t* SafeTensors::get_bf16_ptr(const char* name) const {
     return (const uint16_t*)data(t);
 }
 
+bool SafeTensors::convert_bf16_to_f16_into(uint16_t* dst, const char* name, int64_t expected_numel) const {
+    const SFTensor* t = find(name);
+    if (!t) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return false;
+    }
+    int64_t n = numel(t);
+    if (expected_numel > 0 && n != expected_numel) {
+        fprintf(stderr, "Shape mismatch for %s: expected %lld, got %lld\n", name, expected_numel, n);
+        return false;
+    }
+    const uint16_t* bf16 = (const uint16_t*)data(t);
+    bf16_to_f16_vec(dst, bf16, (int)n);
+    return true;
+}
+
+bool SafeTensors::convert_bf16_to_f32_into(float* dst, const char* name, int64_t expected_numel) const {
+    const SFTensor* t = find(name);
+    if (!t) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return false;
+    }
+    int64_t n = numel(t);
+    if (expected_numel > 0 && n != expected_numel) {
+        fprintf(stderr, "Shape mismatch for %s: expected %lld, got %lld\n", name, expected_numel, n);
+        return false;
+    }
+    const uint16_t* bf16 = (const uint16_t*)data(t);
+    bf16_to_f32_vec(dst, bf16, (int)n);
+    return true;
+}
+
 // Build ANE weight blob: 128-byte header + FP16 data
 // Same format as ane_bridge_build_weight_blob / ane_runtime build_weight_blob
 static bool write_ane_blob(const std::string& path, const uint16_t* bf16_data, int64_t num_elements) {

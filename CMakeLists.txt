@@ -45,6 +45,7 @@ set(CORE_SOURCES
     common.cpp
     core/safetensors.cpp
     core/model_loader.cpp
+    core/weight_cache.cpp
     core/tokenizer.cpp
     core/cpu_ops.cpp
     core/sampling.cpp
@@ -63,12 +64,32 @@ set(MAIN_SOURCE
     main.cpp
 )
 
+# Compile Metal shaders to metallib
+set(METAL_SOURCE "${CMAKE_SOURCE_DIR}/core/kernels.metal")
+set(METALLIB_OUTPUT "${CMAKE_BINARY_DIR}/kernels.metallib")
+set(METAL_AIR "${CMAKE_BINARY_DIR}/kernels.air")
+
+add_custom_command(
+    OUTPUT ${METALLIB_OUTPUT}
+    COMMAND xcrun -sdk macosx metal -c -target air64-apple-macos13.0 -o ${METAL_AIR} ${METAL_SOURCE}
+    COMMAND xcrun -sdk macosx metallib -o ${METALLIB_OUTPUT} ${METAL_AIR}
+    DEPENDS ${METAL_SOURCE}
+    COMMENT "Compiling Metal shaders → kernels.metallib"
+)
+add_custom_target(metal_shaders DEPENDS ${METALLIB_OUTPUT})
+
 # Executable
 add_executable(ane_cpp
     ${VENDOR_SOURCES}
     ${CORE_SOURCES}
     ${MODEL_SOURCES}
     ${MAIN_SOURCE}
+)
+add_dependencies(ane_cpp metal_shaders)
+
+# Pass metallib path as compile definition
+target_compile_definitions(ane_cpp PRIVATE
+    METALLIB_PATH="${METALLIB_OUTPUT}"
 )
 
 set_target_properties(ane_cpp PROPERTIES OUTPUT_NAME "ane.cpp")

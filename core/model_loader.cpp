@@ -169,6 +169,24 @@ float* ModelWeights::load_norm_weight(const char* name, int64_t expected_numel) 
     return sf->load_norm_weight(name, expected_numel);
 }
 
+bool ModelWeights::convert_bf16_to_f16_into(uint16_t* dst, const char* name, int64_t expected_numel) const {
+    const SafeTensors* sf = owner_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return false;
+    }
+    return sf->convert_bf16_to_f16_into(dst, name, expected_numel);
+}
+
+bool ModelWeights::convert_bf16_to_f32_into(float* dst, const char* name, int64_t expected_numel) const {
+    const SafeTensors* sf = owner_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return false;
+    }
+    return sf->convert_bf16_to_f32_into(dst, name, expected_numel);
+}
+
 int ModelWeights::write_ane_blobs(const std::string& output_dir) const {
     int total = 0;
     for (const auto& sf : shards_) {

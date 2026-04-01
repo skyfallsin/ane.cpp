@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../core/model_loader.h"
+#include "../../core/weight_cache.h"
 #include "../../core/ane_runtime.h"
 #include "../../core/sampling.h"
 #include <nlohmann/json.hpp>
@@ -247,6 +248,8 @@ private:
         void* down_proj = nullptr;    // fp16 [hidden × inter]
         void* a_proj = nullptr;       // fp16 [num_val_heads × hidden] (DeltaNet A)
         void* b_proj = nullptr;       // fp16 [num_val_heads × hidden] (DeltaNet B)
+        void* input_layernorm = nullptr;           // f32 [hidden] in Metal buffer for GPU RMSNorm
+        void* post_attention_layernorm = nullptr;  // f32 [hidden] in Metal buffer for GPU RMSNorm
         int first_proj_rows = 0;
         int first_proj_b_rows = 0;
         int o_proj_in = 0;
@@ -254,8 +257,13 @@ private:
     std::vector<GPUWeights> gpu_weights_;
     void* gpu_embed_ = nullptr;        // fp16 [vocab × hidden] for embedding gather
     void* gpu_lm_head_ = nullptr;      // fp16 [vocab × hidden]
+    void* gpu_final_norm_ = nullptr;   // f32 [hidden] for GPU-side final RMSNorm
     bool gpu_weights_loaded_ = false;
+    bool gpu_compute_ready_ = false;   // true if Metal compute kernels are available
+    std::unique_ptr<WeightCache> weight_cache_;  // pre-converted f16 cache (owned)
+    bool gpu_nocopy_ = false;          // true if GPU weights are zero-copy from cache
     bool load_gpu_weights(ModelWeights* sf);
+    bool load_gpu_weights_from_cache(WeightCache* cache, ModelWeights* sf);
     void free_gpu_weights();
 
     std::vector<LayerANEKernels> ane_layers_;

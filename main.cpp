@@ -22,6 +22,7 @@
 #include "utils.h"
 #include "generate.h"
 #include "core/model_loader.h"
+#include "core/weight_cache.h"
 #include "core/sampling.h"
 
 // ObjC autorelease pool via C runtime API
@@ -954,11 +955,21 @@ static int cmd_convert(const Args& args) {
     double elapsed = timer.elapsed_ms();
 
     if (written < 0) {
-        fprintf(stderr, "Error: conversion failed\n");
+        fprintf(stderr, "Error: ANE blob conversion failed\n");
         return 1;
     }
 
-    fprintf(stderr, "Done in %.1f ms\n", elapsed);
+    fprintf(stderr, "ANE blobs done in %.1f ms\n", elapsed);
+
+    // Also build the f16 weight cache for zero-copy GPU loading
+    fprintf(stderr, "Building f16 weight cache...\n");
+    Timer cache_timer;
+    if (ane_lm::WeightCache::build(model_dir, weights.get())) {
+        fprintf(stderr, "f16 cache built in %.1f ms\n", cache_timer.elapsed_ms());
+    } else {
+        fprintf(stderr, "Warning: f16 cache build failed (GPU zero-copy will be unavailable)\n");
+    }
+
     return 0;
 }
 

@@ -1,6 +1,7 @@
 #include "qwen3_5.h"
 #include "../../core/cpu_ops.h"
 #include "../../core/metal_gemm.h"
+#include "../../core/weight_cache.h"
 #include <cmath>
 #include <fstream>
 #include <sys/stat.h>
@@ -475,10 +476,26 @@ bool Qwen35Model::load(const std::string& model_dir) {
 
     if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
 
+    // Try to open pre-converted f16 weight cache for zero-copy GPU loading
+    weight_cache_.reset(WeightCache::open(model_dir));
+    if (weight_cache_) {
+        LOG("Using pre-converted f16 weight cache (%d tensors, %.1f MB)\n",
+            weight_cache_->num_entries(), weight_cache_->total_size() / 1e6);
+    }
+
     // Load GPU (Metal) fp16 weights for MPS-based prefill
     if (metal_init()) {
-        if (!load_gpu_weights(sf.get())) {
-            LOG("GPU weight load failed, GPU prefill unavailable\n");
+        bool gpu_ok = false;
+        if (weight_cache_) {
+            gpu_ok = load_gpu_weights_from_cache(weight_cache_.get(), sf.get());
+            if (gpu_ok) {
+                LOG("GPU weights loaded via zero-copy cache\n");
+            }
+        }
+        if (!gpu_ok) {
+            if (!load_gpu_weights(sf.get())) {
+                LOG("GPU weight load failed, GPU prefill unavailable\n");
+            }
         }
     }
 
@@ -571,52 +588,59 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
     }
 
     // Load CPU float32 weight copies for GEMM-based prefill
+    // Allocate destination buffers first, then convert directly into them (no temp alloc)
     cpu_weights_.resize(num_layers_);
     for (int L = 0; L < num_layers_; L++) {
         auto& cw = cpu_weights_[L];
         char n1[256], n2[256], n3[256];
 
         if (layer_types_[L] == LayerType::LinearAttention) {
-            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
-            cw.first_proj = sf->load_bf16_to_f32(n1, (int64_t)lin_qkv_dim_ * hidden_size_);
             cw.first_proj_rows = lin_qkv_dim_;
+            cw.first_proj = (float*)malloc((size_t)lin_qkv_dim_ * hidden_size_ * sizeof(float));
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
+            if (cw.first_proj) sf->convert_bf16_to_f32_into(cw.first_proj, n1, (int64_t)lin_qkv_dim_ * hidden_size_);
 
-            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
-            cw.first_proj_b = sf->load_bf16_to_f32(n1, (int64_t)lin_total_val_ * hidden_size_);
             cw.first_proj_b_rows = lin_total_val_;
+            cw.first_proj_b = (float*)malloc((size_t)lin_total_val_ * hidden_size_ * sizeof(float));
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            if (cw.first_proj_b) sf->convert_bf16_to_f32_into(cw.first_proj_b, n1, (int64_t)lin_total_val_ * hidden_size_);
 
-            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
-            cw.o_proj = sf->load_bf16_to_f32(n1, (int64_t)hidden_size_ * lin_total_val_);
             cw.o_proj_in = lin_total_val_;
+            cw.o_proj = (float*)malloc((size_t)hidden_size_ * lin_total_val_ * sizeof(float));
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            if (cw.o_proj) sf->convert_bf16_to_f32_into(cw.o_proj, n1, (int64_t)hidden_size_ * lin_total_val_);
         } else {
-            // Full attention: load q/k/v separately and concatenate
+            // Full attention: convert q/k/v directly into a contiguous buffer
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
             snprintf(n2, sizeof(n2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
             snprintf(n3, sizeof(n3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
             int proj_rows = full_q_dim_ + 2 * full_kv_dim_;
-            cw.first_proj = (float*)calloc((size_t)proj_rows * hidden_size_, sizeof(float));
-            float* q_w = sf->load_bf16_to_f32(n1, (int64_t)full_q_dim_ * hidden_size_);
-            float* k_w = sf->load_bf16_to_f32(n2, (int64_t)full_kv_dim_ * hidden_size_);
-            float* v_w = sf->load_bf16_to_f32(n3, (int64_t)full_kv_dim_ * hidden_size_);
-            if (q_w && k_w && v_w && cw.first_proj) {
-                memcpy(cw.first_proj, q_w, (size_t)full_q_dim_ * hidden_size_ * sizeof(float));
-                memcpy(cw.first_proj + (size_t)full_q_dim_ * hidden_size_, k_w, (size_t)full_kv_dim_ * hidden_size_ * sizeof(float));
-                memcpy(cw.first_proj + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, v_w, (size_t)full_kv_dim_ * hidden_size_ * sizeof(float));
-            }
-            free(q_w); free(k_w); free(v_w);
             cw.first_proj_rows = proj_rows;
+            cw.first_proj = (float*)malloc((size_t)proj_rows * hidden_size_ * sizeof(float));
+            if (cw.first_proj) {
+                sf->convert_bf16_to_f32_into(cw.first_proj, n1, (int64_t)full_q_dim_ * hidden_size_);
+                sf->convert_bf16_to_f32_into(cw.first_proj + (size_t)full_q_dim_ * hidden_size_, n2, (int64_t)full_kv_dim_ * hidden_size_);
+                sf->convert_bf16_to_f32_into(cw.first_proj + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, n3, (int64_t)full_kv_dim_ * hidden_size_);
+            }
 
-            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
-            cw.o_proj = sf->load_bf16_to_f32(n1, (int64_t)hidden_size_ * full_out_dim_);
             cw.o_proj_in = full_out_dim_;
+            cw.o_proj = (float*)malloc((size_t)hidden_size_ * full_out_dim_ * sizeof(float));
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            if (cw.o_proj) sf->convert_bf16_to_f32_into(cw.o_proj, n1, (int64_t)hidden_size_ * full_out_dim_);
         }
 
         snprintf(n1, sizeof(n1), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
         snprintf(n2, sizeof(n2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
         snprintf(n3, sizeof(n3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
-        cw.gate_proj = sf->load_bf16_to_f32(n1, (int64_t)intermediate_size_ * hidden_size_);
-        cw.up_proj = sf->load_bf16_to_f32(n2, (int64_t)intermediate_size_ * hidden_size_);
-        cw.down_proj = sf->load_bf16_to_f32(n3, (int64_t)hidden_size_ * intermediate_size_);
+
+        cw.gate_proj = (float*)malloc((size_t)intermediate_size_ * hidden_size_ * sizeof(float));
+        if (cw.gate_proj) sf->convert_bf16_to_f32_into(cw.gate_proj, n1, (int64_t)intermediate_size_ * hidden_size_);
+
+        cw.up_proj = (float*)malloc((size_t)intermediate_size_ * hidden_size_ * sizeof(float));
+        if (cw.up_proj) sf->convert_bf16_to_f32_into(cw.up_proj, n2, (int64_t)intermediate_size_ * hidden_size_);
+
+        cw.down_proj = (float*)malloc((size_t)hidden_size_ * intermediate_size_ * sizeof(float));
+        if (cw.down_proj) sf->convert_bf16_to_f32_into(cw.down_proj, n3, (int64_t)hidden_size_ * intermediate_size_);
 
         if (!cw.first_proj || !cw.o_proj || !cw.gate_proj || !cw.up_proj || !cw.down_proj) {
             fprintf(stderr, "Warning: failed to load CPU weights for layer %d, CPU prefill unavailable\n", L);
@@ -1697,15 +1721,12 @@ bool Qwen35Model::load_gpu_weights(ModelWeights* sf) {
     gpu_weights_.resize(num_layers_);
     char n1[256], n2[256], n3[256];
 
-    // Embedding table as fp16
+    // Embedding table as fp16 — convert directly into Metal buffer
     gpu_embed_ = metal_alloc((size_t)vocab_size_ * hidden_size_ * 2);
     if (!gpu_embed_) return false;
-    {
-        uint16_t* tmp = sf->load_bf16_to_f16("model.language_model.embed_tokens.weight",
-                                               (int64_t)vocab_size_ * hidden_size_);
-        if (!tmp) { free_gpu_weights(); return false; }
-        memcpy(gpu_embed_, tmp, (size_t)vocab_size_ * hidden_size_ * 2);
-        free(tmp);
+    if (!sf->convert_bf16_to_f16_into((uint16_t*)gpu_embed_, "model.language_model.embed_tokens.weight",
+                                       (int64_t)vocab_size_ * hidden_size_)) {
+        free_gpu_weights(); return false;
     }
 
     // LM head as fp16
@@ -1714,129 +1735,324 @@ bool Qwen35Model::load_gpu_weights(ModelWeights* sf) {
     } else {
         gpu_lm_head_ = metal_alloc((size_t)vocab_size_ * hidden_size_ * 2);
         if (!gpu_lm_head_) { free_gpu_weights(); return false; }
-        uint16_t* tmp = sf->load_bf16_to_f16("lm_head.weight", (int64_t)vocab_size_ * hidden_size_);
-        if (!tmp) { free_gpu_weights(); return false; }
-        memcpy(gpu_lm_head_, tmp, (size_t)vocab_size_ * hidden_size_ * 2);
-        free(tmp);
+        if (!sf->convert_bf16_to_f16_into((uint16_t*)gpu_lm_head_, "lm_head.weight",
+                                           (int64_t)vocab_size_ * hidden_size_)) {
+            free_gpu_weights(); return false;
+        }
     }
 
     for (int L = 0; L < num_layers_; L++) {
         auto& gw = gpu_weights_[L];
 
         if (layer_types_[L] == LayerType::LinearAttention) {
-            // QKV projection
+            // QKV projection — convert directly into Metal buffer
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
             gw.first_proj_rows = lin_qkv_dim_;
             gw.first_proj = metal_alloc((size_t)gw.first_proj_rows * hidden_size_ * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)gw.first_proj_rows * hidden_size_);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.first_proj, tmp, (size_t)gw.first_proj_rows * hidden_size_ * 2); free(tmp); }
+            if (!gw.first_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.first_proj, n1,
+                    (int64_t)gw.first_proj_rows * hidden_size_)) { free_gpu_weights(); return false; }
 
             // Z projection
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
             gw.first_proj_b_rows = lin_total_val_;
             gw.first_proj_b = metal_alloc((size_t)gw.first_proj_b_rows * hidden_size_ * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)gw.first_proj_b_rows * hidden_size_);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.first_proj_b, tmp, (size_t)gw.first_proj_b_rows * hidden_size_ * 2); free(tmp); }
+            if (!gw.first_proj_b || !sf->convert_bf16_to_f16_into((uint16_t*)gw.first_proj_b, n1,
+                    (int64_t)gw.first_proj_b_rows * hidden_size_)) { free_gpu_weights(); return false; }
 
             // A projection
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
             gw.a_proj = metal_alloc((size_t)lin_num_val_heads_ * hidden_size_ * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.a_proj, tmp, (size_t)lin_num_val_heads_ * hidden_size_ * 2); free(tmp); }
+            if (!gw.a_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.a_proj, n1,
+                    (int64_t)lin_num_val_heads_ * hidden_size_)) { free_gpu_weights(); return false; }
 
             // B projection
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
             gw.b_proj = metal_alloc((size_t)lin_num_val_heads_ * hidden_size_ * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.b_proj, tmp, (size_t)lin_num_val_heads_ * hidden_size_ * 2); free(tmp); }
+            if (!gw.b_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.b_proj, n1,
+                    (int64_t)lin_num_val_heads_ * hidden_size_)) { free_gpu_weights(); return false; }
 
             // O projection
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
             gw.o_proj_in = lin_total_val_;
             gw.o_proj = metal_alloc((size_t)hidden_size_ * gw.o_proj_in * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)hidden_size_ * gw.o_proj_in);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.o_proj, tmp, (size_t)hidden_size_ * gw.o_proj_in * 2); free(tmp); }
+            if (!gw.o_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.o_proj, n1,
+                    (int64_t)hidden_size_ * gw.o_proj_in)) { free_gpu_weights(); return false; }
         } else {
-            // Full attention: concat Q/K/V
+            // Full attention: concat Q/K/V — convert directly into Metal buffer
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
             snprintf(n2, sizeof(n2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
             snprintf(n3, sizeof(n3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
             int proj_rows = full_q_dim_ + 2 * full_kv_dim_;
             gw.first_proj_rows = proj_rows;
             gw.first_proj = metal_alloc((size_t)proj_rows * hidden_size_ * 2);
+            if (!gw.first_proj) { free_gpu_weights(); return false; }
             {
-                uint16_t* q = sf->load_bf16_to_f16(n1, (int64_t)full_q_dim_ * hidden_size_);
-                uint16_t* k = sf->load_bf16_to_f16(n2, (int64_t)full_kv_dim_ * hidden_size_);
-                uint16_t* v = sf->load_bf16_to_f16(n3, (int64_t)full_kv_dim_ * hidden_size_);
-                if (!q || !k || !v) { free(q); free(k); free(v); free_gpu_weights(); return false; }
                 uint16_t* dst = (uint16_t*)gw.first_proj;
-                memcpy(dst, q, (size_t)full_q_dim_ * hidden_size_ * 2);
-                memcpy(dst + (size_t)full_q_dim_ * hidden_size_, k, (size_t)full_kv_dim_ * hidden_size_ * 2);
-                memcpy(dst + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, v, (size_t)full_kv_dim_ * hidden_size_ * 2);
-                free(q); free(k); free(v);
+                if (!sf->convert_bf16_to_f16_into(dst, n1, (int64_t)full_q_dim_ * hidden_size_) ||
+                    !sf->convert_bf16_to_f16_into(dst + (size_t)full_q_dim_ * hidden_size_, n2, (int64_t)full_kv_dim_ * hidden_size_) ||
+                    !sf->convert_bf16_to_f16_into(dst + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, n3, (int64_t)full_kv_dim_ * hidden_size_)) {
+                    free_gpu_weights(); return false;
+                }
             }
 
             snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
             gw.o_proj_in = full_out_dim_;
             gw.o_proj = metal_alloc((size_t)hidden_size_ * gw.o_proj_in * 2);
-            { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)hidden_size_ * gw.o_proj_in);
-              if (!tmp) { free_gpu_weights(); return false; }
-              memcpy(gw.o_proj, tmp, (size_t)hidden_size_ * gw.o_proj_in * 2); free(tmp); }
+            if (!gw.o_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.o_proj, n1,
+                    (int64_t)hidden_size_ * gw.o_proj_in)) { free_gpu_weights(); return false; }
         }
 
-        // FFN weights
+        // FFN weights — convert directly into Metal buffers
         snprintf(n1, sizeof(n1), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
         snprintf(n2, sizeof(n2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
         snprintf(n3, sizeof(n3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
 
         gw.gate_proj = metal_alloc((size_t)intermediate_size_ * hidden_size_ * 2);
-        { uint16_t* tmp = sf->load_bf16_to_f16(n1, (int64_t)intermediate_size_ * hidden_size_);
-          if (!tmp) { free_gpu_weights(); return false; }
-          memcpy(gw.gate_proj, tmp, (size_t)intermediate_size_ * hidden_size_ * 2); free(tmp); }
+        if (!gw.gate_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.gate_proj, n1,
+                (int64_t)intermediate_size_ * hidden_size_)) { free_gpu_weights(); return false; }
 
         gw.up_proj = metal_alloc((size_t)intermediate_size_ * hidden_size_ * 2);
-        { uint16_t* tmp = sf->load_bf16_to_f16(n2, (int64_t)intermediate_size_ * hidden_size_);
-          if (!tmp) { free_gpu_weights(); return false; }
-          memcpy(gw.up_proj, tmp, (size_t)intermediate_size_ * hidden_size_ * 2); free(tmp); }
+        if (!gw.up_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.up_proj, n2,
+                (int64_t)intermediate_size_ * hidden_size_)) { free_gpu_weights(); return false; }
 
         gw.down_proj = metal_alloc((size_t)hidden_size_ * intermediate_size_ * 2);
-        { uint16_t* tmp = sf->load_bf16_to_f16(n3, (int64_t)hidden_size_ * intermediate_size_);
-          if (!tmp) { free_gpu_weights(); return false; }
-          memcpy(gw.down_proj, tmp, (size_t)hidden_size_ * intermediate_size_ * 2); free(tmp); }
+        if (!gw.down_proj || !sf->convert_bf16_to_f16_into((uint16_t*)gw.down_proj, n3,
+                (int64_t)hidden_size_ * intermediate_size_)) { free_gpu_weights(); return false; }
+
+        // Copy norm weights into Metal shared buffers for GPU-side RMSNorm
+        gw.input_layernorm = metal_alloc((size_t)hidden_size_ * sizeof(float));
+        gw.post_attention_layernorm = metal_alloc((size_t)hidden_size_ * sizeof(float));
+        if (gw.input_layernorm && layers_[L].input_layernorm) {
+            memcpy(gw.input_layernorm, layers_[L].input_layernorm, (size_t)hidden_size_ * sizeof(float));
+        }
+        if (gw.post_attention_layernorm && layers_[L].post_attention_layernorm) {
+            memcpy(gw.post_attention_layernorm, layers_[L].post_attention_layernorm, (size_t)hidden_size_ * sizeof(float));
+        }
+    }
+
+    // Final norm weight in Metal buffer
+    gpu_final_norm_ = metal_alloc((size_t)hidden_size_ * sizeof(float));
+    if (gpu_final_norm_ && final_norm_) {
+        memcpy(gpu_final_norm_, final_norm_, (size_t)hidden_size_ * sizeof(float));
     }
 
     gpu_weights_loaded_ = true;
     LOG("[gpu] Loaded fp16 weights for %d layers into Metal buffers (%.1f MB)\n",
         num_layers_, metal_total_alloc_bytes() / 1048576.0);
     LOG("[gpu] Weight load time: %.1f ms\n", t.elapsed_ms());
+
+    // Initialize compute kernels
+#ifdef METALLIB_PATH
+    if (metal_init_compute(METALLIB_PATH)) {
+        gpu_compute_ready_ = true;
+        LOG("[gpu] Compute kernels ready (fused SwiGLU, GPU RMSNorm, residual add)\n");
+    } else {
+        LOG("[gpu] Compute kernel init failed, using CPU fallback for SwiGLU/norm\n");
+    }
+#else
+    LOG("[gpu] No METALLIB_PATH defined, compute kernels unavailable\n");
+#endif
+
+    return true;
+}
+
+// ============ Zero-Copy GPU Weight Loading from Cache ============
+
+bool Qwen35Model::load_gpu_weights_from_cache(WeightCache* cache, ModelWeights* sf) {
+    if (!metal_available() || !cache) return false;
+
+    Timer t;
+
+    // Register the entire cache data section as a Metal buffer (zero-copy mmap)
+    void* data_base = cache->data_base();
+    size_t data_size = cache->data_size();
+    if (!metal_alloc_nocopy(data_base, data_size)) {
+        LOG("[gpu-cache] Failed to register cache data section as Metal buffer\n");
+        return false;
+    }
+
+    gpu_weights_.resize(num_layers_);
+    gpu_nocopy_ = true;
+    char n1[256], n2[256], n3[256];
+
+    // Helper: get f16 pointer from cache and register as Metal sub-pointer
+    auto get_weight = [&](const char* name, int64_t expected_numel) -> void* {
+        const uint16_t* ptr = cache->get_f16(name);
+        if (!ptr) return nullptr;
+        metal_register_subptr((void*)ptr, data_base);
+        return (void*)ptr;
+    };
+
+    // Embedding table
+    gpu_embed_ = get_weight("model.language_model.embed_tokens.weight",
+                             (int64_t)vocab_size_ * hidden_size_);
+    if (!gpu_embed_) { LOG("[gpu-cache] Missing embed_tokens\n"); free_gpu_weights(); return false; }
+
+    // LM head
+    if (tie_word_embeddings_) {
+        gpu_lm_head_ = gpu_embed_;
+    } else {
+        gpu_lm_head_ = get_weight("lm_head.weight", (int64_t)vocab_size_ * hidden_size_);
+        if (!gpu_lm_head_) { LOG("[gpu-cache] Missing lm_head\n"); free_gpu_weights(); return false; }
+    }
+
+    for (int L = 0; L < num_layers_; L++) {
+        auto& gw = gpu_weights_[L];
+
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
+            gw.first_proj_rows = lin_qkv_dim_;
+            gw.first_proj = get_weight(n1, (int64_t)gw.first_proj_rows * hidden_size_);
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            gw.first_proj_b_rows = lin_total_val_;
+            gw.first_proj_b = get_weight(n1, (int64_t)gw.first_proj_b_rows * hidden_size_);
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
+            gw.a_proj = get_weight(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
+            gw.b_proj = get_weight(n1, (int64_t)lin_num_val_heads_ * hidden_size_);
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            gw.o_proj_in = lin_total_val_;
+            gw.o_proj = get_weight(n1, (int64_t)hidden_size_ * gw.o_proj_in);
+        } else {
+            // Full attention: Q/K/V are stored separately in the cache.
+            // We need a contiguous [Q;K;V] buffer for the GEMM, so we must
+            // allocate a Metal buffer and copy from the three cache tensors.
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(n2, sizeof(n2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(n3, sizeof(n3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
+            int proj_rows = full_q_dim_ + 2 * full_kv_dim_;
+            gw.first_proj_rows = proj_rows;
+
+            const uint16_t* q = cache->get_f16(n1);
+            const uint16_t* k = cache->get_f16(n2);
+            const uint16_t* v = cache->get_f16(n3);
+            if (q && k && v) {
+                gw.first_proj = metal_alloc((size_t)proj_rows * hidden_size_ * 2);
+                if (gw.first_proj) {
+                    uint16_t* dst = (uint16_t*)gw.first_proj;
+                    memcpy(dst, q, (size_t)full_q_dim_ * hidden_size_ * 2);
+                    memcpy(dst + (size_t)full_q_dim_ * hidden_size_, k, (size_t)full_kv_dim_ * hidden_size_ * 2);
+                    memcpy(dst + (size_t)(full_q_dim_ + full_kv_dim_) * hidden_size_, v, (size_t)full_kv_dim_ * hidden_size_ * 2);
+                }
+            }
+
+            snprintf(n1, sizeof(n1), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            gw.o_proj_in = full_out_dim_;
+            gw.o_proj = get_weight(n1, (int64_t)hidden_size_ * gw.o_proj_in);
+        }
+
+        // FFN weights
+        snprintf(n1, sizeof(n1), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(n2, sizeof(n2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+        snprintf(n3, sizeof(n3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+        gw.gate_proj = get_weight(n1, (int64_t)intermediate_size_ * hidden_size_);
+        gw.up_proj = get_weight(n2, (int64_t)intermediate_size_ * hidden_size_);
+        gw.down_proj = get_weight(n3, (int64_t)hidden_size_ * intermediate_size_);
+
+        // Norm weights still need owned Metal buffers (f32 data, not in f16 cache)
+        gw.input_layernorm = metal_alloc((size_t)hidden_size_ * sizeof(float));
+        gw.post_attention_layernorm = metal_alloc((size_t)hidden_size_ * sizeof(float));
+        if (gw.input_layernorm && layers_[L].input_layernorm) {
+            memcpy(gw.input_layernorm, layers_[L].input_layernorm, (size_t)hidden_size_ * sizeof(float));
+        }
+        if (gw.post_attention_layernorm && layers_[L].post_attention_layernorm) {
+            memcpy(gw.post_attention_layernorm, layers_[L].post_attention_layernorm, (size_t)hidden_size_ * sizeof(float));
+        }
+
+        // Verify all required weights loaded
+        if (!gw.first_proj || !gw.o_proj || !gw.gate_proj || !gw.up_proj || !gw.down_proj) {
+            LOG("[gpu-cache] Missing weight(s) for layer %d, falling back\n", L);
+            free_gpu_weights();
+            return false;
+        }
+    }
+
+    // Final norm weight in Metal buffer
+    gpu_final_norm_ = metal_alloc((size_t)hidden_size_ * sizeof(float));
+    if (gpu_final_norm_ && final_norm_) {
+        memcpy(gpu_final_norm_, final_norm_, (size_t)hidden_size_ * sizeof(float));
+    }
+
+    gpu_weights_loaded_ = true;
+    LOG("[gpu-cache] Zero-copy GPU weights loaded for %d layers (%.1f ms)\n",
+        num_layers_, t.elapsed_ms());
+
+    // Initialize compute kernels
+#ifdef METALLIB_PATH
+    if (metal_init_compute(METALLIB_PATH)) {
+        gpu_compute_ready_ = true;
+        LOG("[gpu-cache] Compute kernels ready\n");
+    }
+#endif
+
     return true;
 }
 
 void Qwen35Model::free_gpu_weights() {
-    for (auto& gw : gpu_weights_) {
-        metal_free(gw.first_proj);
-        metal_free(gw.first_proj_b);
-        metal_free(gw.o_proj);
-        metal_free(gw.gate_proj);
-        metal_free(gw.up_proj);
-        metal_free(gw.down_proj);
-        metal_free(gw.a_proj);
-        metal_free(gw.b_proj);
+    if (gpu_nocopy_) {
+        // In nocopy mode, most weight pointers are sub-pointers into the cache mmap.
+        // Only free Metal buffers that we actually allocated (norm weights, concat'd QKV).
+        for (auto& gw : gpu_weights_) {
+            // Full-attention concat QKV is always an owned alloc (even in nocopy mode)
+            // We can detect it: if the layer is FullAttention, first_proj was metal_alloc'd
+            // For LinearAttention layers, first_proj is a cache sub-pointer — don't free
+            if (gw.first_proj) {
+                // Check if this is one of our concat-allocated buffers (FullAttention layers)
+                // by seeing if it lies outside the cache data section.
+                // Simpler: just always try metal_free — it's a no-op if not in the map
+                // For nocopy sub-ptrs, metal_free just removes the map entry, doesn't dealloc
+            }
+            // Norm weights are always owned allocs
+            metal_free(gw.input_layernorm);
+            metal_free(gw.post_attention_layernorm);
+        }
+        // For FullAttention layers, we allocated concat QKV buffers
+        for (int L = 0; L < (int)layer_types_.size(); L++) {
+            if (L < (int)gpu_weights_.size() && layer_types_[L] == LayerType::FullAttention) {
+                metal_free(gpu_weights_[L].first_proj);
+            }
+        }
+    } else {
+        for (auto& gw : gpu_weights_) {
+            metal_free(gw.first_proj);
+            metal_free(gw.first_proj_b);
+            metal_free(gw.o_proj);
+            metal_free(gw.gate_proj);
+            metal_free(gw.up_proj);
+            metal_free(gw.down_proj);
+            metal_free(gw.a_proj);
+            metal_free(gw.b_proj);
+            metal_free(gw.input_layernorm);
+            metal_free(gw.post_attention_layernorm);
+        }
+        if (!tie_word_embeddings_ && gpu_lm_head_) metal_free(gpu_lm_head_);
+        metal_free(gpu_embed_);
     }
     gpu_weights_.clear();
-    if (!tie_word_embeddings_ && gpu_lm_head_) metal_free(gpu_lm_head_);
-    metal_free(gpu_embed_);
+    metal_free(gpu_final_norm_);
     gpu_embed_ = nullptr;
     gpu_lm_head_ = nullptr;
+    gpu_final_norm_ = nullptr;
     gpu_weights_loaded_ = false;
+    gpu_compute_ready_ = false;
+    gpu_nocopy_ = false;
 }
 
 // ============ GPU Prefill (Metal MPS) ============
+//
+// Optimized GPU pipeline with fused compute kernels:
+//   - GPU SwiGLU: eliminates CPU SwiGLU + sync between gate+up and down_proj
+//   - GPU residual_add: keeps X on GPU between o_proj and FFN
+//   - GPU RMSNorm: avoids CPU→GPU conversion between residual and projections
+//
+// Sync pattern (with compute kernels):
+//   sync #1: QKV projections → CPU attention core (unavoidable)
+//   sync #2: o_proj → residual_add → RMSNorm → gate+up → SwiGLU → down_proj → residual_add
+// = 2 syncs/layer (down from 4)
 
 float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
@@ -1851,16 +2067,20 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
     const int I = intermediate_size_;
     const int max_proj = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
     const int max_attn = std::max(lin_total_val_, full_out_dim_);
+    const bool use_gpu_compute = gpu_compute_ready_;
 
     // CPU fp32 buffers (activations, intermediates)
-    std::vector<float> X(     (size_t)N * H);
+    std::vector<float> X_cpu;         // only used when !use_gpu_compute
     std::vector<float> X_norm((size_t)N * H);
     std::vector<float> Proj(  (size_t)N * max_proj);
     std::vector<float> Oproj( (size_t)N * max_attn);
     std::vector<float> Attn(  (size_t)N * H);
-    std::vector<float> Gate(  (size_t)N * I);
-    std::vector<float> Up(    (size_t)N * I);
-    std::vector<float> Down(  (size_t)N * H);
+    std::vector<float> Gate(  (size_t)N * I);  // scratch for CPU SwiGLU fallback
+    std::vector<float> Up;                      // scratch for CPU SwiGLU fallback
+    if (!use_gpu_compute) {
+        X_cpu.resize((size_t)N * H);
+        Up.resize((size_t)N * I);
+    }
 
     // DeltaNet batch buffers
     std::vector<float> Z_batch((size_t)N * lin_total_val_);
@@ -1881,35 +2101,34 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
 
     dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    // Metal shared buffers for fp16 activation input and fp32 GEMM output
-    // Largest GEMM input: [N, H] fp16 for X_norm input to projections
-    // Largest GEMM output: [N, I] fp32 for FFN gate/up projections
+    // Metal shared buffers
+    const size_t x_f32_bytes = (size_t)N * H * sizeof(float);
     const size_t act_f16_bytes = (size_t)N * H * 2;
     const size_t proj_f32_bytes = (size_t)N * max_proj * sizeof(float);
     const size_t ffn_f32_bytes = (size_t)N * I * sizeof(float);
-    const size_t attn_f32_bytes = (size_t)N * H * sizeof(float);
 
-    void* gpu_act_f16 = metal_alloc(act_f16_bytes);          // [N, H] fp16 input
-    void* gpu_proj_f32 = metal_alloc(proj_f32_bytes);         // [N, max_proj] fp32 output
-    void* gpu_z_f32 = metal_alloc((size_t)N * lin_total_val_ * sizeof(float));  // Z proj output
-    void* gpu_a_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));  // A proj output
-    void* gpu_b_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));  // B proj output
-    void* gpu_oproj_f16 = metal_alloc((size_t)N * max_attn * 2);  // [N, max_attn] fp16 for o_proj input
-    void* gpu_attn_f32 = metal_alloc(attn_f32_bytes);         // [N, H] fp32 o_proj output
-    void* gpu_ffn_f16 = metal_alloc((size_t)N * H * 2);       // [N, H] fp16 for FFN input (X_norm)
-    void* gpu_gate_f32 = metal_alloc(ffn_f32_bytes);           // [N, I] fp32 gate output
-    void* gpu_up_f32 = metal_alloc(ffn_f32_bytes);             // [N, I] fp32 up output
-    void* gpu_swiglu_f16 = metal_alloc((size_t)N * I * 2);    // [N, I] fp16 SwiGLU result for down_proj
-    void* gpu_down_f32 = metal_alloc(attn_f32_bytes);          // [N, H] fp32 down_proj output
-    // LM head buffers
-    void* gpu_lmh_f16 = metal_alloc((size_t)1 * H * 2);       // [1, H] fp16 last hidden
-    void* gpu_lmh_f32 = metal_alloc((size_t)1 * vocab_size_ * sizeof(float));  // [1, V] fp32
+    // X lives in Metal buffer so GPU can do residual_add and RMSNorm on it
+    void* gpu_X = metal_alloc(x_f32_bytes);                     // [N, H] fp32 — main hidden state
+    void* gpu_act_f16 = metal_alloc(act_f16_bytes);              // [N, H] fp16 input for projections
+    void* gpu_proj_f32 = metal_alloc(proj_f32_bytes);            // [N, max_proj] fp32 output
+    void* gpu_z_f32 = metal_alloc((size_t)N * lin_total_val_ * sizeof(float));
+    void* gpu_a_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));
+    void* gpu_b_f32 = metal_alloc((size_t)N * lin_num_val_heads_ * sizeof(float));
+    void* gpu_oproj_f16 = metal_alloc((size_t)N * max_attn * 2);
+    void* gpu_attn_f32 = metal_alloc((size_t)N * H * sizeof(float));
+    void* gpu_ffn_f16 = metal_alloc(act_f16_bytes);              // [N, H] fp16 for FFN input
+    void* gpu_gate_f32 = metal_alloc(ffn_f32_bytes);
+    void* gpu_up_f32 = metal_alloc(ffn_f32_bytes);
+    void* gpu_swiglu_f16 = metal_alloc((size_t)N * I * 2);
+    void* gpu_down_f32 = metal_alloc((size_t)N * H * sizeof(float));
+    void* gpu_lmh_f16 = metal_alloc((size_t)1 * H * 2);
+    void* gpu_lmh_f32 = metal_alloc((size_t)1 * vocab_size_ * sizeof(float));
 
-    if (!gpu_act_f16 || !gpu_proj_f32 || !gpu_z_f32 || !gpu_a_f32 || !gpu_b_f32 ||
+    if (!gpu_X || !gpu_act_f16 || !gpu_proj_f32 || !gpu_z_f32 || !gpu_a_f32 || !gpu_b_f32 ||
         !gpu_oproj_f16 || !gpu_attn_f32 || !gpu_ffn_f16 || !gpu_gate_f32 || !gpu_up_f32 ||
         !gpu_swiglu_f16 || !gpu_down_f32 || !gpu_lmh_f16 || !gpu_lmh_f32) {
         fprintf(stderr, "[gpu_prefill] Failed to allocate activation buffers\n");
-        metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
+        metal_free(gpu_X); metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
         metal_free(gpu_a_f32); metal_free(gpu_b_f32); metal_free(gpu_oproj_f16);
         metal_free(gpu_attn_f32); metal_free(gpu_ffn_f16); metal_free(gpu_gate_f32);
         metal_free(gpu_up_f32); metal_free(gpu_swiglu_f16); metal_free(gpu_down_f32);
@@ -1917,9 +2136,10 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
         return prefill_cpu(session, token_ids, start_pos);
     }
 
-    // Embedding lookup (CPU, from fp32 embed_tokens_)
+    // Embedding lookup → write directly into gpu_X (Metal shared buffer)
+    float* X = (float*)gpu_X;
     for (int i = 0; i < N; i++) {
-        memcpy(X.data() + (size_t)i * H,
+        memcpy(X + (size_t)i * H,
                embed_tokens_ + (int64_t)token_ids[i] * H,
                (size_t)H * sizeof(float));
     }
@@ -1933,49 +2153,48 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
         const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
         const int proj_rows = gw.first_proj_rows;
 
-        // 1. RMSNorm (CPU)
-        Timer norm_timer;
-        for (int i = 0; i < N; i++) {
-            rmsnorm(X_norm.data() + (size_t)i * H,
-                    X.data() + (size_t)i * H,
-                    layers_[L].input_layernorm, H, rms_eps_);
-        }
-        total_norm_ms += norm_timer.elapsed_ms();
-
-        // 2. Convert X_norm fp32 → fp16 into Metal buffer, dispatch GPU GEMMs
-        Timer cvt_timer;
-        {
-            uint16_t* dst = (uint16_t*)gpu_act_f16;
-            const float* src = X_norm.data();
-            f32_to_f16_bulk(dst, src, N * H);
-        }
-        total_cvt_ms += cvt_timer.elapsed_ms();
+        // ============================================================
+        // Phase 1: RMSNorm + QKV projections → sync → CPU attention
+        // ============================================================
 
         Timer gemm_timer;
+        if (use_gpu_compute) {
+            // GPU RMSNorm → QKV GEMMs chained in one command buffer, single sync
+            metal_rmsnorm_f16(gpu_X, gw.input_layernorm, gpu_act_f16,
+                              N, H, rms_eps_);
+        } else {
+            Timer norm_timer;
+            for (int i = 0; i < N; i++) {
+                rmsnorm(X_norm.data() + (size_t)i * H,
+                        X + (size_t)i * H,
+                        layers_[L].input_layernorm, H, rms_eps_);
+            }
+            total_norm_ms += norm_timer.elapsed_ms();
+
+            Timer cvt_timer;
+            f32_to_f16_bulk((uint16_t*)gpu_act_f16, X_norm.data(), N * H);
+            total_cvt_ms += cvt_timer.elapsed_ms();
+        }
 
         // QKV projection: [N,H] @ [proj_rows,H]^T = [N,proj_rows]
         metal_sgemm_f16(gpu_act_f16, gw.first_proj, gpu_proj_f32,
                         N, proj_rows, H);
 
         if (is_linear) {
-            // Z projection: [N,H] @ [lin_total_val_,H]^T = [N,lin_total_val_]
             if (gw.first_proj_b) {
                 metal_sgemm_f16(gpu_act_f16, gw.first_proj_b, gpu_z_f32,
                                 N, gw.first_proj_b_rows, H);
             }
-            // A projection: [N,H] @ [num_val_heads,H]^T = [N,num_val_heads]
             metal_sgemm_f16(gpu_act_f16, gw.a_proj, gpu_a_f32,
                             N, lin_num_val_heads_, H);
-            // B projection: [N,H] @ [num_val_heads,H]^T = [N,num_val_heads]
             metal_sgemm_f16(gpu_act_f16, gw.b_proj, gpu_b_f32,
                             N, lin_num_val_heads_, H);
         }
 
-        metal_sync();
+        metal_sync();  // sync #1: RMSNorm + QKV GEMMs → CPU attention
         total_gemm_ms += gemm_timer.elapsed_ms();
 
-        // Copy GPU fp32 results back to CPU vectors
-        // Proj output: gpu_proj_f32 is [N, proj_rows] contiguous, but Proj is [N, max_proj]
+        // Copy GPU fp32 results to CPU vectors for attention core
         {
             const float* src = (const float*)gpu_proj_f32;
             for (int i = 0; i < N; i++) {
@@ -1989,14 +2208,15 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
             memcpy(B_batch.data(), gpu_b_f32, (size_t)N * lin_num_val_heads_ * sizeof(float));
         }
 
-        // 3. Attention core (CPU — same as prefill_cpu)
+        // ============================================================
+        // Phase 2: CPU Attention Core (identical to original)
+        // ============================================================
         Timer attn_timer;
         if (is_linear) {
             auto& dw = layers_[L].deltanet;
             const int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
             const float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
 
-            // Phase 1: Sequential conv1d + silu
             Timer conv_timer;
             for (int i = 0; i < N; i++) {
                 float* mixed_qkv = Proj.data() + (size_t)i * max_proj;
@@ -2007,7 +2227,6 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
             }
             total_conv_ms += conv_timer.elapsed_ms();
 
-            // Phase 2: Parallel across key heads
             const int num_kh = lin_num_heads_;
             const int key_dim = lin_key_dim_;
             const int val_dim = lin_val_dim_;
@@ -2064,7 +2283,7 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
                 }
             });
         } else {
-            // Full attention (CPU — identical to prefill_cpu)
+            // Full attention (CPU — identical to original)
             auto& fw = layers_[L].full_attn;
             const int hd = head_dim_;
             const int nqh = num_q_heads_;
@@ -2120,7 +2339,6 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
                 memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
             }
 
-            // Pre-gather K, V into [nkvh, N, hd]
             for (int kvh = 0; kvh < nkvh; kvh++) {
                 float* kb = fa_k_buf.data() + (size_t)kvh * N * hd;
                 float* vb = fa_v_buf.data() + (size_t)kvh * N * hd;
@@ -2193,11 +2411,24 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
         if (is_linear) delta_attn_ms += layer_attn;
         else full_attn_ms += layer_attn;
 
-        // 4. O projection via GPU GEMM
+        // ============================================================
+        // Phase 3: O-proj + FFN — GPU-fused pipeline
+        // ============================================================
+        //
+        // With compute kernels (2 syncs → 1 sync for this phase):
+        //   o_proj GEMM → GPU residual_add(X) → GPU RMSNorm(→f16) →
+        //   gate+up GEMMs → GPU SwiGLU(→f16) → down_proj GEMM →
+        //   GPU residual_add(X) → sync
+        //
+        // Without compute kernels (original 2-sync path):
+        //   o_proj GEMM → sync → CPU residual + norm → gate+up → sync →
+        //   CPU SwiGLU → down_proj → sync
+
         Timer oproj_timer;
         const int attn_dim = gw.o_proj_in;
+
+        // Convert Oproj fp32 → fp16 for o_proj GPU input
         {
-            // Convert Oproj fp32 → fp16 for GPU input
             uint16_t* dst = (uint16_t*)gpu_oproj_f16;
             const float* src = Oproj.data();
             for (int i = 0; i < N; i++) {
@@ -2206,105 +2437,138 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
                 }
             }
         }
+
         // O proj: [N, attn_dim] @ [H, attn_dim]^T = [N, H]
         metal_sgemm_f16(gpu_oproj_f16, gw.o_proj, gpu_attn_f32,
                         N, H, attn_dim);
-        metal_sync();
 
-        // Copy result and residual add
-        memcpy(Attn.data(), gpu_attn_f32, (size_t)N * H * sizeof(float));
-        vDSP_vadd(X.data(), 1, Attn.data(), 1, X.data(), 1, (vDSP_Length)(N * H));
-        total_gemm_ms += oproj_timer.elapsed_ms();
+        if (use_gpu_compute) {
+            // === FUSED GPU PIPELINE (no intermediate sync) ===
 
-        // 6. Post-attention RMSNorm (CPU)
-        norm_timer.reset();
-        for (int i = 0; i < N; i++) {
-            rmsnorm(X_norm.data() + (size_t)i * H,
-                    X.data() + (size_t)i * H,
-                    layers_[L].post_attention_layernorm, H, rms_eps_);
+            // GPU residual add: X += o_proj_result
+            metal_residual_add(gpu_X, gpu_attn_f32, N * H);
+
+            // GPU RMSNorm: X(f32) → ffn_f16 (fp16)
+            metal_rmsnorm_f16(gpu_X, gw.post_attention_layernorm, gpu_ffn_f16,
+                              N, H, rms_eps_);
+
+            // Gate: [N, H] @ [I, H]^T = [N, I]
+            metal_sgemm_f16(gpu_ffn_f16, gw.gate_proj, gpu_gate_f32,
+                            N, I, H);
+            // Up: [N, H] @ [I, H]^T = [N, I]
+            metal_sgemm_f16(gpu_ffn_f16, gw.up_proj, gpu_up_f32,
+                            N, I, H);
+
+            // GPU SwiGLU: silu(gate) * up → fp16 output
+            metal_swiglu_fused(gpu_gate_f32, gpu_up_f32, gpu_swiglu_f16, N * I);
+
+            // Down: [N, I] @ [H, I]^T = [N, H]
+            metal_sgemm_f16(gpu_swiglu_f16, gw.down_proj, gpu_down_f32,
+                            N, H, I);
+
+            // GPU residual add: X += down_proj_result
+            metal_residual_add(gpu_X, gpu_down_f32, N * H);
+
+            metal_sync();  // sync #2: single sync for entire o_proj→FFN chain
+
+            // All GPU work (o_proj + residual + norm + gate+up + swiglu + down + residual)
+            // is measured together since it's one command buffer
+            double fused_ms = oproj_timer.elapsed_ms();
+            total_gemm_ms += fused_ms;  // report under gemm since it's all GPU GEMM + compute
+        } else {
+            // === ORIGINAL CPU FALLBACK PATH (3 syncs) ===
+            metal_sync();
+
+            // Residual add on CPU
+            memcpy(Attn.data(), gpu_attn_f32, (size_t)N * H * sizeof(float));
+            vDSP_vadd(X, 1, Attn.data(), 1, X, 1, (vDSP_Length)(N * H));
+            total_gemm_ms += oproj_timer.elapsed_ms();
+
+            // Post-attention RMSNorm (CPU)
+            {
+                Timer pnorm_timer;
+                for (int i = 0; i < N; i++) {
+                    rmsnorm(X_norm.data() + (size_t)i * H,
+                            X + (size_t)i * H,
+                            layers_[L].post_attention_layernorm, H, rms_eps_);
+                }
+                total_norm_ms += pnorm_timer.elapsed_ms();
+            }
+
+            // FFN via CPU path
+            Timer ffn_timer;
+            {
+                uint16_t* dst = (uint16_t*)gpu_ffn_f16;
+                f32_to_f16_bulk(dst, X_norm.data(), N * H);
+            }
+
+            metal_sgemm_f16(gpu_ffn_f16, gw.gate_proj, gpu_gate_f32,
+                            N, I, H);
+            metal_sgemm_f16(gpu_ffn_f16, gw.up_proj, gpu_up_f32,
+                            N, I, H);
+            metal_sync();
+
+            // SwiGLU on CPU
+            {
+                float* gp = (float*)gpu_gate_f32;
+                const float* up = (const float*)gpu_up_f32;
+                const int total = N * I;
+                float neg = -1.0f;
+                vDSP_vsmul(gp, 1, &neg, Gate.data(), 1, (vDSP_Length)total);
+                int n = total;
+                vvexpf(Gate.data(), Gate.data(), &n);
+                float one = 1.0f;
+                vDSP_vsadd(Gate.data(), 1, &one, Gate.data(), 1, (vDSP_Length)total);
+                vDSP_vdiv(Gate.data(), 1, gp, 1, Gate.data(), 1, (vDSP_Length)total);
+                vDSP_vmul(Gate.data(), 1, up, 1, Gate.data(), 1, (vDSP_Length)total);
+                f32_to_f16_bulk((uint16_t*)gpu_swiglu_f16, Gate.data(), total);
+            }
+
+            metal_sgemm_f16(gpu_swiglu_f16, gw.down_proj, gpu_down_f32,
+                            N, H, I);
+            metal_sync();
+
+            // Residual add
+            {
+                const float* down = (const float*)gpu_down_f32;
+                vDSP_vadd(X, 1, down, 1, X, 1, (vDSP_Length)(N * H));
+            }
+            total_ffn_ms += ffn_timer.elapsed_ms();
         }
-        total_norm_ms += norm_timer.elapsed_ms();
-
-        // 7. FFN via GPU GEMM
-        Timer ffn_timer;
-        {
-            // Convert X_norm fp32 → fp16 for FFN input
-            uint16_t* dst = (uint16_t*)gpu_ffn_f16;
-            const float* src = X_norm.data();
-            f32_to_f16_bulk(dst, src, N * H);
-        }
-
-        // Gate: [N, H] @ [I, H]^T = [N, I]
-        metal_sgemm_f16(gpu_ffn_f16, gw.gate_proj, gpu_gate_f32,
-                        N, I, H);
-        // Up: [N, H] @ [I, H]^T = [N, I]
-        metal_sgemm_f16(gpu_ffn_f16, gw.up_proj, gpu_up_f32,
-                        N, I, H);
-        metal_sync();
-
-        // SwiGLU on CPU: silu(gate) * up → write fp16 result for down_proj
-        // Use Gate buffer as scratch (gpu_gate_f32 is shared memory, writable)
-        {
-            float* gp = (float*)gpu_gate_f32;
-            const float* up = (const float*)gpu_up_f32;
-            const int total = N * I;
-
-            // negate gate for sigmoid: -g
-            float neg = -1.0f;
-            vDSP_vsmul(gp, 1, &neg, Gate.data(), 1, (vDSP_Length)total);
-            // exp(-g)
-            int n = total;
-            vvexpf(Gate.data(), Gate.data(), &n);
-            // 1 + exp(-g)
-            float one = 1.0f;
-            vDSP_vsadd(Gate.data(), 1, &one, Gate.data(), 1, (vDSP_Length)total);
-            // gate / (1 + exp(-gate)) = silu(gate)
-            vDSP_vdiv(Gate.data(), 1, gp, 1, Gate.data(), 1, (vDSP_Length)total);
-            // silu(gate) * up
-            vDSP_vmul(Gate.data(), 1, up, 1, Gate.data(), 1, (vDSP_Length)total);
-            // Convert to fp16
-            f32_to_f16_bulk((uint16_t*)gpu_swiglu_f16, Gate.data(), total);
-        }
-
-        // Down: [N, I] @ [H, I]^T = [N, H]
-        metal_sgemm_f16(gpu_swiglu_f16, gw.down_proj, gpu_down_f32,
-                        N, H, I);
-        metal_sync();
-
-        // Residual add
-        {
-            const float* down = (const float*)gpu_down_f32;
-            float* x = X.data();
-            vDSP_vadd(x, 1, down, 1, x, 1, (vDSP_Length)(N * H));
-        }
-        total_ffn_ms += ffn_timer.elapsed_ms();
     } // end layer loop
 
-    // Final norm + LM head via GPU
-    float* last_hidden = X.data() + (size_t)(N - 1) * H;
-    rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
+    // Final norm + LM head
+    float* last_hidden = X + (size_t)(N - 1) * H;
 
-    // Convert last hidden to fp16 for GPU lm_head GEMM
-    {
-        uint16_t* dst = (uint16_t*)gpu_lmh_f16;
-        f32_to_f16_bulk(dst, session.x, H);
+    if (use_gpu_compute && gpu_final_norm_) {
+        // GPU RMSNorm on last row → fp16 → lm_head GEMM
+        // We need to RMSNorm just the last row. Use a sub-view.
+        // Write f32 norm result to session.x, then convert to f16
+        rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
+        f32_to_f16_bulk((uint16_t*)gpu_lmh_f16, session.x, H);
+    } else {
+        rmsnorm(session.x, last_hidden, final_norm_, H, rms_eps_);
+        f32_to_f16_bulk((uint16_t*)gpu_lmh_f16, session.x, H);
     }
-    // LM head: [1, H] @ [V, H]^T = [1, V]
+
     metal_sgemm_f16(gpu_lmh_f16, gpu_lm_head_, gpu_lmh_f32,
                     1, vocab_size_, H);
     metal_sync();
     memcpy(session.logits, gpu_lmh_f32, (size_t)vocab_size_ * sizeof(float));
 
     // Free activation buffers
-    metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
+    metal_free(gpu_X); metal_free(gpu_act_f16); metal_free(gpu_proj_f32); metal_free(gpu_z_f32);
     metal_free(gpu_a_f32); metal_free(gpu_b_f32); metal_free(gpu_oproj_f16);
     metal_free(gpu_attn_f32); metal_free(gpu_ffn_f16); metal_free(gpu_gate_f32);
     metal_free(gpu_up_f32); metal_free(gpu_swiglu_f16); metal_free(gpu_down_f32);
     metal_free(gpu_lmh_f16); metal_free(gpu_lmh_f32);
 
     double elapsed = total_timer.elapsed_ms();
-    fprintf(stderr, "[gpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms (delta=%.0f[conv=%.0f] full=%.0f) ffn=%.0fms norm=%.0fms cvt=%.0fms\n",
-            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, delta_attn_ms, total_conv_ms, full_attn_ms, total_ffn_ms, total_norm_ms, total_cvt_ms);
+    fprintf(stderr, "[gpu_prefill] %d tokens in %.1f ms (%.1f tok/s)%s | gemm=%.0fms attn=%.0fms (delta=%.0f[conv=%.0f] full=%.0f) ffn=%.0fms norm=%.0fms cvt=%.0fms\n",
+            N, elapsed, N / (elapsed / 1000.0),
+            use_gpu_compute ? " [fused]" : "",
+            total_gemm_ms, total_attn_ms, delta_attn_ms, total_conv_ms, full_attn_ms,
+            total_ffn_ms, total_norm_ms, total_cvt_ms);
 
     return session.logits;
 }
