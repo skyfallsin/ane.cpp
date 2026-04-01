@@ -3,6 +3,7 @@
 #include "../../core/model_loader.h"
 #include "../../core/weight_cache.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/metal_gemm.h"
 #include "../../core/sampling.h"
 #include <nlohmann/json.hpp>
 #include <memory>
@@ -237,18 +238,31 @@ private:
         int first_proj_rows = 0;
         int first_proj_b_rows = 0;
         int o_proj_in = 0;
+
+        // INT8 quantized weight variants (populated when ANE_INT8=1)
+        MetalInt8Weight first_proj_i8;
+        MetalInt8Weight first_proj_b_i8;
+        MetalInt8Weight o_proj_i8;
+        MetalInt8Weight gate_proj_i8;
+        MetalInt8Weight up_proj_i8;
+        MetalInt8Weight down_proj_i8;
+        MetalInt8Weight a_proj_i8;
+        MetalInt8Weight b_proj_i8;
     };
     std::vector<GPUWeights> gpu_weights_;
     void* gpu_embed_ = nullptr;        // fp16 [vocab × hidden] for embedding gather
     void* gpu_lm_head_ = nullptr;      // fp16 [vocab × hidden]
+    MetalInt8Weight gpu_lm_head_i8_;   // INT8 lm_head (when ANE_INT8=1)
     void* gpu_final_norm_ = nullptr;   // f32 [hidden] for GPU-side final RMSNorm
     bool gpu_weights_loaded_ = false;
+    bool gpu_int8_ready_ = false;      // true if INT8 GPU weights are quantized and ready
     bool gpu_compute_ready_ = false;   // true if Metal compute kernels are available
     std::unique_ptr<WeightCache> weight_cache_;  // pre-converted f16 cache (owned)
     bool gpu_nocopy_ = false;          // true if GPU weights are zero-copy from cache
     bool load_gpu_weights(ModelWeights* sf);
     bool load_gpu_weights_from_cache(WeightCache* cache, ModelWeights* sf);
     void free_gpu_weights();
+    bool quantize_gpu_weights_int8();  // Quantize fp16 GPU weights to int8
 
     std::vector<LayerANEKernels> ane_layers_;
 

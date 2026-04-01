@@ -73,6 +73,36 @@ bool metal_rmsnorm_f16(const void* x_f32, const void* weight_f32, void* out_f16,
 // f32 → f16 conversion on GPU
 bool metal_f32_to_f16(const void* in_f32, void* out_f16, int count);
 
+// ============ INT8 GEMM ============
+
+// INT8 quantized weight for GPU GEMM
+struct MetalInt8Weight {
+    void* data = nullptr;    // int8 [rows × cols] in Metal buffer
+    void* scales = nullptr;  // fp16 [rows] in Metal buffer
+    int rows = 0;
+    int cols = 0;
+};
+
+// Quantize fp16 weights to int8 with per-row symmetric quantization.
+// Input: fp16 [rows × cols] pointer (must be in a Metal buffer).
+// Returns MetalInt8Weight with newly allocated Metal buffers.
+// Call metal_free_int8_weight() to release.
+MetalInt8Weight metal_quantize_f16_to_int8(const void* fp16_weights, int rows, int cols);
+
+// Free int8 weight buffers
+void metal_free_int8_weight(MetalInt8Weight* w);
+
+// Perform C = A @ B_int8^T * scales using custom Metal compute shader.
+// A: [M, K] fp16 (activations, in Metal buffer)
+// B_int8: MetalInt8Weight with data [N, K] int8 and scales [N] fp16
+// C: [M, N] fp32 output (in Metal buffer)
+// Enqueues on current command buffer — call metal_sync() to complete.
+bool metal_sgemm_int8(
+    const void* A,              // [M, K] fp16
+    const MetalInt8Weight& W,   // weight: data [N, K] int8 + scales [N] fp16
+    void* C,                    // [M, N] fp32 output
+    int M, int N, int K);
+
 // Stats
 uint64_t metal_total_alloc_bytes();
 

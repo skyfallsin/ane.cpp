@@ -6,6 +6,8 @@
 
 #include <unordered_map>
 #include <mutex>
+#include <cmath>
+#include <arm_fp16.h>
 
 namespace ane_lm {
 
@@ -26,6 +28,7 @@ static id<MTLComputePipelineState> g_swiglu_pso = nil;
 static id<MTLComputePipelineState> g_residual_add_pso = nil;
 static id<MTLComputePipelineState> g_rmsnorm_f16_pso = nil;
 static id<MTLComputePipelineState> g_f32_to_f16_pso = nil;
+static id<MTLComputePipelineState> g_gemm_int8_pso = nil;
 static bool g_compute_initialized = false;
 
 // --- Init / Shutdown ---
@@ -294,13 +297,19 @@ bool metal_init_compute(const char* metallib_path) {
         g_residual_add_pso = make_pso("residual_add_f32");
         g_rmsnorm_f16_pso = make_pso("rmsnorm_f16out");
         g_f32_to_f16_pso = make_pso("f32_to_f16_kernel");
+        g_gemm_int8_pso = make_pso("gemm_int8");
 
         if (!g_swiglu_pso || !g_residual_add_pso || !g_rmsnorm_f16_pso || !g_f32_to_f16_pso) {
             return false;
         }
+        // gemm_int8 is optional — only needed when ANE_INT8=1
+        if (!g_gemm_int8_pso) {
+            LOG("[metal] Warning: gemm_int8 kernel not found (INT8 GPU prefill unavailable)\n");
+        }
 
         g_compute_initialized = true;
-        LOG("[metal] Compute kernels loaded: swiglu, residual_add, rmsnorm_f16, f32_to_f16\n");
+        LOG("[metal] Compute kernels loaded: swiglu, residual_add, rmsnorm_f16, f32_to_f16%s\n",
+            g_gemm_int8_pso ? ", gemm_int8" : "");
         return true;
     }
 }
@@ -416,6 +425,131 @@ bool metal_f32_to_f16(const void* in_f32, void* out_f16, int count) {
     id<MTLBuffer> bufs[] = {b0, b1};
     NSUInteger offsets[] = {off0, off1};
     return dispatch_1d(g_f32_to_f16_pso, bufs, offsets, 2, count);
+}
+
+// ============ INT8 GEMM ============
+
+MetalInt8Weight metal_quantize_f16_to_int8(const void* fp16_weights, int rows, int cols) {
+    MetalInt8Weight result;
+    if (!fp16_weights || rows <= 0 || cols <= 0) return result;
+
+    const size_t data_bytes = (size_t)rows * cols;
+    const size_t scales_bytes = (size_t)rows * 2;  // fp16
+
+    // Allocate Metal buffers for int8 data and scales
+    void* q_data = metal_alloc(data_bytes);
+    void* q_scales = metal_alloc(scales_bytes);
+    if (!q_data || !q_scales) {
+        if (q_data) metal_free(q_data);
+        if (q_scales) metal_free(q_scales);
+        return result;
+    }
+
+    // Quantize: for each row, find absmax, compute scale, quantize to int8
+    const uint16_t* src = (const uint16_t*)fp16_weights;
+    int8_t* dst = (int8_t*)q_data;
+    uint16_t* scales = (uint16_t*)q_scales;
+
+    for (int r = 0; r < rows; r++) {
+        const uint16_t* row_src = src + (size_t)r * cols;
+        int8_t* row_dst = dst + (size_t)r * cols;
+
+        // Find absmax using __fp16 hardware
+        float amax = 0.0f;
+        const __fp16* fp16_row = (const __fp16*)row_src;
+        for (int c = 0; c < cols; c++) {
+            float v = (float)fp16_row[c];
+            float a = v < 0 ? -v : v;
+            if (a > amax) amax = a;
+        }
+
+        float scale = amax / 127.0f;
+        if (scale < 1e-10f) scale = 1e-10f;
+        float inv_scale = (amax > 1e-10f) ? (127.0f / amax) : 0.0f;
+
+        // Store scale as fp16
+        scales[r] = (uint16_t)((__fp16)scale);
+
+        // Quantize row
+        for (int c = 0; c < cols; c++) {
+            float v = (float)fp16_row[c];
+            int qv = (int)roundf(v * inv_scale);
+            if (qv > 127) qv = 127;
+            if (qv < -128) qv = -128;
+            row_dst[c] = (int8_t)qv;
+        }
+    }
+
+    result.data = q_data;
+    result.scales = q_scales;
+    result.rows = rows;
+    result.cols = cols;
+    return result;
+}
+
+void metal_free_int8_weight(MetalInt8Weight* w) {
+    if (!w) return;
+    metal_free(w->data);
+    metal_free(w->scales);
+    w->data = nullptr;
+    w->scales = nullptr;
+    w->rows = 0;
+    w->cols = 0;
+}
+
+bool metal_sgemm_int8(
+    const void* A,
+    const MetalInt8Weight& W,
+    void* C,
+    int M, int N, int K)
+{
+    if (!g_compute_initialized || !g_gemm_int8_pso) return false;
+    if (!A || !W.data || !W.scales || !C || M <= 0 || N <= 0 || K <= 0) return false;
+
+    id<MTLBuffer> bufA = find_buffer(A);
+    id<MTLBuffer> bufB = find_buffer(W.data);
+    id<MTLBuffer> bufS = find_buffer(W.scales);
+    id<MTLBuffer> bufC = find_buffer(C);
+    if (!bufA || !bufB || !bufS || !bufC) {
+        fprintf(stderr, "[metal] sgemm_int8: buffer not found\n");
+        return false;
+    }
+
+    NSUInteger offA = (NSUInteger)((const uint8_t*)A - (const uint8_t*)[bufA contents]);
+    NSUInteger offB = (NSUInteger)((const uint8_t*)W.data - (const uint8_t*)[bufB contents]);
+    NSUInteger offS = (NSUInteger)((const uint8_t*)W.scales - (const uint8_t*)[bufS contents]);
+    NSUInteger offC = (NSUInteger)((uint8_t*)C - (uint8_t*)[bufC contents]);
+
+    // Params: { M, N, K }
+    uint32_t params[3] = { (uint32_t)M, (uint32_t)N, (uint32_t)K };
+    id<MTLBuffer> bufP = [g_device newBufferWithBytes:params
+                                               length:sizeof(params)
+                                              options:MTLResourceStorageModeShared];
+    if (!bufP) return false;
+
+    id<MTLCommandBuffer> cmdbuf = get_cmdbuf();
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    if (!enc) return false;
+
+    [enc setComputePipelineState:g_gemm_int8_pso];
+    [enc setBuffer:bufA offset:offA atIndex:0];
+    [enc setBuffer:bufB offset:offB atIndex:1];
+    [enc setBuffer:bufS offset:offS atIndex:2];
+    [enc setBuffer:bufC offset:offC atIndex:3];
+    [enc setBuffer:bufP offset:0 atIndex:4];
+
+    // Threadgroup grid: ceil(N/BN) × ceil(M/BM)
+    // Each TG is 128 threads (4 simdgroups × 32), computing a 64×64 output block
+    const NSUInteger BM = 64, BN = 64;
+    NSUInteger grid_x = ((NSUInteger)N + BN - 1) / BN;
+    NSUInteger grid_y = ((NSUInteger)M + BM - 1) / BM;
+
+    MTLSize threadgroups = MTLSizeMake(grid_x, grid_y, 1);
+    MTLSize tg_size = MTLSizeMake(128, 1, 1);  // 4 simdgroups × 32 threads
+
+    [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg_size];
+    [enc endEncoding];
+    return true;
 }
 
 uint64_t metal_total_alloc_bytes() {
