@@ -151,7 +151,6 @@ public:
     float* forward(Session& session, int token_id, int pos);
     bool forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch);
     float* prefill(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
-    float* prefill_cpu(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     float* prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     std::unique_ptr<Session> create_session() const;
     void reset_session(Session& session) const;
@@ -221,21 +220,6 @@ private:
     float* embed_tokens_ = nullptr;
     float* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
-
-    // CPU weight pointers for GEMM-based prefill
-    struct CPUWeights {
-        float* first_proj = nullptr;   // QKV projection [proj_rows × hidden]
-        float* first_proj_b = nullptr; // Z projection for linear layers [z_rows × hidden]
-        float* o_proj = nullptr;       // Output projection [hidden × attn_dim]
-        float* gate_proj = nullptr;    // FFN gate [inter × hidden]
-        float* up_proj = nullptr;      // FFN up [inter × hidden]
-        float* down_proj = nullptr;    // FFN down [hidden × inter]
-        int first_proj_rows = 0;
-        int first_proj_b_rows = 0;
-        int o_proj_in = 0;             // attn_dim
-    };
-    std::vector<CPUWeights> cpu_weights_;
-    float* cpu_lm_head_ = nullptr;     // may alias lm_head_ if already f32
 
     // GPU (Metal) fp16 weight pointers for MPS-based prefill
     // These point into Metal shared buffers (allocated via metal_alloc)
