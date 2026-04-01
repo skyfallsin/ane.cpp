@@ -1,0 +1,450 @@
+{
+  "ane": {
+    "config": "4B-INT8 (ane)",
+    "duration_min": 1.0,
+    "wall_time_s": 68.51,
+    "turns_completed": 6,
+    "turns_failed": 0,
+    "total_prompt_tokens": 1886,
+    "total_completion_tokens": 579,
+    "total_tokens": 2465,
+    "avg_prefill_tok_s": 78.7,
+    "avg_decode_tok_s": 13.0,
+    "avg_cpu_mw": 6334.723427672959,
+    "avg_gpu_mw": 5259.296124528301,
+    "avg_ane_mw": 695.2678081761007,
+    "avg_combined_mw": 12289.285220125783,
+    "peak_combined_mw": 55622.5,
+    "total_energy_j": 832.18,
+    "total_tok_per_joule": 3.0,
+    "prompt_tok_per_joule": 2.3,
+    "decode_tok_per_joule": 0.7,
+    "power_windows": [
+      {
+        "start_s": 0,
+        "end_s": 30,
+        "avg_cpu_mw": 6563.029785714288,
+        "avg_gpu_mw": 9541.981249999995,
+        "avg_ane_mw": 698.950035714286,
+        "avg_combined_mw": 16803.95864285714,
+        "peak_combined_mw": 55622.5,
+        "total_energy_mj": 501468,
+        "thermal_pressure": "Nominal",
+        "samples": 140
+      },
+      {
+        "start_s": 30,
+        "end_s": 60,
+        "avg_cpu_mw": 6234.1436619718315,
+        "avg_gpu_mw": 2311.1704669014084,
+        "avg_ane_mw": 708.3549929577466,
+        "avg_combined_mw": 9253.666619718311,
+        "peak_combined_mw": 41399.1,
+        "total_energy_mj": 279390,
+        "thermal_pressure": "Nominal",
+        "samples": 142
+      }
+    ],
+    "turns": [
+      {
+        "turn": 1,
+        "prompt": "A Transformer processes a sequence of tokens entirely in **parallel**, unlike traditional Recurrent Neural Networks (RNNs) which process data sequentially. This is achieved through two main architectural components: **Self-Attention** and **Feed-Forward Networks**, arranged in stacked layers with specific positional encoding to handle order information.\n\nHere is the step-by-step logical flow of how a standard Transformer processes an input sequence $X = [x_1, x_2, \\dots, x_n]$:\n\n",
+        "prompt_tokens": 28,
+        "completion_tokens": 100,
+        "total_tokens": 128,
+        "wall_s": 12.742103625001619,
+        "prefill_tok_s": 5.54477851643854,
+        "decode_tok_s": 13.0,
+        "error": null
+      },
+      {
+        "turn": 2,
+        "prompt": "# 102. \u4e8c\u8fdb\u5236\u6c42\u548c\n## \u9898\u76ee\u63cf\u8ff0\uff1a\n\u7ed9\u5b9a\u4e24\u4e2a\u4e8c\u8fdb\u5236\u5b57\u7b26\u4e32\uff0c\u8fd4\u56de\u5b83\u4eec\u7684\u548c\uff08\u7528\u4e8c\u8fdb\u5236\u8868\u793a\uff09\u3002\n\n\u8f93\u5165\u4e3a\u975e\u7a7a\u5b57\u7b26\u4e32\u4e14\u53ea\u5305\u542b\u6570\u5b57 `1` \u6216 `0`\u3002\n\n### \u793a\u4f8b\uff1a\n- \u8f93\u5165: `a = \"11\"`, `b = \"1\"`\n- \u8f93\u51fa: `\"100\"`\n\n- \u8f93\u5165: `a = \"10101\"`, `b",
+        "prompt_tokens": 154,
+        "completion_tokens": 100,
+        "total_tokens": 254,
+        "wall_s": 11.329414624982746,
+        "prefill_tok_s": 42.34134515443972,
+        "decode_tok_s": 13.0,
+        "error": null
+      },
+      {
+        "turn": 3,
+        "prompt": "(user) 10:37 AM - Hi, I am working on a new feature that will be able to display the list of all users.\n\nI was thinking about creating a separate table `users` with columns like id, name, email, etc., and then using SQL queries to fetch this data from the database.\n\nHowever, I am also considering using the GraphQL schema's built-in functionality to handle user data.\n\nMy main concern is whether it would be better to create",
+        "prompt_tokens": 281,
+        "completion_tokens": 100,
+        "total_tokens": 381,
+        "wall_s": 11.323523415980162,
+        "prefill_tok_s": 77.38455145149229,
+        "decode_tok_s": 13.0,
+        "error": null
+      },
+      {
+        "turn": 4,
+        "prompt": "&user=102936567&token=0f845c84a1e92b6947d98e0943977904\n</code></pre>\n        </div>\n      </div>\n\n    </div>\n  </body>\n</html>\n```",
+        "prompt_tokens": 406,
+        "completion_tokens": 79,
+        "total_tokens": 485,
+        "wall_s": 9.297928458021488,
+        "prefill_tok_s": 126.04760065987467,
+        "decode_tok_s": 13.0,
+        "error": null
+      },
+      {
+        "turn": 5,
+        "prompt": ") 1475:30, 2016-08-29T01:47:51Z\n+ (https://www.iana.org/assignments/timesnames/time-names.xhtml#gmt) 1475:30, 2016-08-29T01:47:51Z\n+ (UTC) 1475:30, 201",
+        "prompt_tokens": 509,
+        "completion_tokens": 100,
+        "total_tokens": 609,
+        "wall_s": 11.1928998749936,
+        "prefill_tok_s": 145.40396979617842,
+        "decode_tok_s": 13.0,
+        "error": null
+      },
+      {
+        "turn": 6,
+        "prompt": ". 2017 Mar; 36(3): e485\u2013e500.\nPMCID: PMC5394836\n\n# A New Classification of Acute Leukemia Based on the Molecular and Cytogenetic Profiles\n\n## Abstract\n\nThe molecular classification of acute leukemia has evolved in the last two decades, with new genetic lesions being identified that have important clinical implications. The International Workshop on Acute Myeloid Leukemia (",
+        "prompt_tokens": 508,
+        "completion_tokens": 100,
+        "total_tokens": 608,
+        "wall_s": 12.623604458989576,
+        "prefill_tok_s": 103.01549958061386,
+        "decode_tok_s": 13.0,
+        "error": null
+      }
+    ],
+    "thermal_pressures": [
+      "Nominal"
+    ],
+    "error": null
+  },
+  "llama": {
+    "config": "4B-Q8_0 (llama)",
+    "duration_min": 1.0,
+    "wall_time_s": 61.02,
+    "turns_completed": 25,
+    "turns_failed": 0,
+    "total_prompt_tokens": 4832,
+    "total_completion_tokens": 2500,
+    "total_tokens": 7332,
+    "avg_prefill_tok_s": 941.4,
+    "avg_decode_tok_s": 44.9,
+    "avg_cpu_mw": 6096.487950530037,
+    "avg_gpu_mw": 33132.351943462905,
+    "avg_ane_mw": 1.9961698939929327,
+    "avg_combined_mw": 39230.833568904585,
+    "peak_combined_mw": 59192.4,
+    "total_energy_j": 2365.18,
+    "total_tok_per_joule": 3.1,
+    "prompt_tok_per_joule": 2.0,
+    "decode_tok_per_joule": 1.1,
+    "power_windows": [
+      {
+        "start_s": 0,
+        "end_s": 30,
+        "avg_cpu_mw": 5490.56392857143,
+        "avg_gpu_mw": 32453.72928571429,
+        "avg_ane_mw": 0.0,
+        "avg_combined_mw": 37944.29,
+        "peak_combined_mw": 46710.9,
+        "total_energy_mj": 1131331,
+        "thermal_pressure": "Nominal",
+        "samples": 140
+      },
+      {
+        "start_s": 30,
+        "end_s": 60,
+        "avg_cpu_mw": 6714.2054609929055,
+        "avg_gpu_mw": 33792.8319148936,
+        "avg_ane_mw": 4.006497021276595,
+        "avg_combined_mw": 40511.04184397163,
+        "peak_combined_mw": 59192.4,
+        "total_energy_mj": 1217164,
+        "thermal_pressure": "Nominal",
+        "samples": 141
+      }
+    ],
+    "turns": [
+      {
+        "turn": 1,
+        "prompt": "",
+        "prompt_tokens": 26,
+        "completion_tokens": 100,
+        "total_tokens": 126,
+        "wall_s": 2.2894053749914747,
+        "prefill_tok_s": 390.91865884829343,
+        "decode_tok_s": 45.01746677710952,
+        "error": null
+      },
+      {
+        "turn": 2,
+        "prompt": "",
+        "prompt_tokens": 48,
+        "completion_tokens": 100,
+        "total_tokens": 148,
+        "wall_s": 2.3391443330037873,
+        "prefill_tok_s": 370.2646620949266,
+        "decode_tok_s": 45.37614784637996,
+        "error": null
+      },
+      {
+        "turn": 3,
+        "prompt": "### 1. Transformer Neural Network Processing Tokens Step-by-Step\n\nA transformer neural network processes input sequences using self",
+        "prompt_tokens": 70,
+        "completion_tokens": 100,
+        "total_tokens": 170,
+        "wall_s": 2.350723042007303,
+        "prefill_tok_s": 610.3089907233033,
+        "decode_tok_s": 44.837399412899096,
+        "error": null
+      },
+      {
+        "turn": 4,
+        "prompt": "",
+        "prompt_tokens": 119,
+        "completion_tokens": 100,
+        "total_tokens": 219,
+        "wall_s": 2.3989492079999764,
+        "prefill_tok_s": 922.3805168431333,
+        "decode_tok_s": 44.18567350233764,
+        "error": null
+      },
+      {
+        "turn": 5,
+        "prompt": "",
+        "prompt_tokens": 138,
+        "completion_tokens": 100,
+        "total_tokens": 238,
+        "wall_s": 2.3899356659967452,
+        "prefill_tok_s": 800.3990395211526,
+        "decode_tok_s": 45.135600885741034,
+        "error": null
+      },
+      {
+        "turn": 6,
+        "prompt": "",
+        "prompt_tokens": 158,
+        "completion_tokens": 100,
+        "total_tokens": 258,
+        "wall_s": 2.393815166025888,
+        "prefill_tok_s": 927.0124383947431,
+        "decode_tok_s": 45.018885422434714,
+        "error": null
+      },
+      {
+        "turn": 7,
+        "prompt": "### Garbage Collection in Modern Programming Languages\n\nGarbage collection (GC) is an automated memory management technique used to reclaim memory occupied by objects that are no longer in use. It frees programmers from manually allocating and deallocating memory,",
+        "prompt_tokens": 176,
+        "completion_tokens": 100,
+        "total_tokens": 276,
+        "wall_s": 2.4133340409898665,
+        "prefill_tok_s": 936.3295880149813,
+        "decode_tok_s": 44.98492330295501,
+        "error": null
+      },
+      {
+        "turn": 8,
+        "prompt": "### What Causes",
+        "prompt_tokens": 224,
+        "completion_tokens": 100,
+        "total_tokens": 324,
+        "wall_s": 2.452247625013115,
+        "prefill_tok_s": 1005.4040467512882,
+        "decode_tok_s": 44.904022143071394,
+        "error": null
+      },
+      {
+        "turn": 9,
+        "prompt": "",
+        "prompt_tokens": 214,
+        "completion_tokens": 100,
+        "total_tokens": 314,
+        "wall_s": 2.44897066699923,
+        "prefill_tok_s": 959.8392493518843,
+        "decode_tok_s": 44.97262291580001,
+        "error": null
+      },
+      {
+        "turn": 10,
+        "prompt": "",
+        "prompt_tokens": 206,
+        "completion_tokens": 100,
+        "total_tokens": 306,
+        "wall_s": 2.443555750011001,
+        "prefill_tok_s": 910.7266803128302,
+        "decode_tok_s": 45.145605865317116,
+        "error": null
+      },
+      {
+        "turn": 11,
+        "prompt": "### Microservices vs. Monolithic Architecture\n\n| Aspect | Monolithic Architecture | Microservices Architecture |\n| :--- | :--- | :--- |\n| **Definition** | A single, unified application where all components are tightly coupled and run in one process. | An",
+        "prompt_tokens": 203,
+        "completion_tokens": 100,
+        "total_tokens": 303,
+        "wall_s": 2.4579760000051465,
+        "prefill_tok_s": 902.9646598314168,
+        "decode_tok_s": 44.913380055225495,
+        "error": null
+      },
+      {
+        "turn": 12,
+        "prompt": "",
+        "prompt_tokens": 244,
+        "completion_tokens": 100,
+        "total_tokens": 344,
+        "wall_s": 2.4667920409992803,
+        "prefill_tok_s": 1033.771273868889,
+        "decode_tok_s": 44.974362364733985,
+        "error": null
+      },
+      {
+        "turn": 13,
+        "prompt": "",
+        "prompt_tokens": 250,
+        "completion_tokens": 100,
+        "total_tokens": 350,
+        "wall_s": 2.4774926250102,
+        "prefill_tok_s": 1038.30946605974,
+        "decode_tok_s": 44.84926386660753,
+        "error": null
+      },
+      {
+        "turn": 14,
+        "prompt": "### What is the Turing Test?\n\nThe",
+        "prompt_tokens": 221,
+        "completion_tokens": 100,
+        "total_tokens": 321,
+        "wall_s": 2.4600764169881586,
+        "prefill_tok_s": 979.0587745373837,
+        "decode_tok_s": 44.900030083020155,
+        "error": null
+      },
+      {
+        "turn": 15,
+        "prompt": "",
+        "prompt_tokens": 230,
+        "completion_tokens": 100,
+        "total_tokens": 330,
+        "wall_s": 2.476205167011358,
+        "prefill_tok_s": 961.5022846130371,
+        "decode_tok_s": 44.86071197538762,
+        "error": null
+      },
+      {
+        "turn": 16,
+        "prompt": "",
+        "prompt_tokens": 221,
+        "completion_tokens": 100,
+        "total_tokens": 321,
+        "wall_s": 2.474855167005444,
+        "prefill_tok_s": 973.5425495361355,
+        "decode_tok_s": 44.62411103192811,
+        "error": null
+      },
+      {
+        "turn": 17,
+        "prompt": "",
+        "prompt_tokens": 222,
+        "completion_tokens": 100,
+        "total_tokens": 322,
+        "wall_s": 2.544305332994554,
+        "prefill_tok_s": 978.0037269871759,
+        "decode_tok_s": 43.286970102555486,
+        "error": null
+      },
+      {
+        "turn": 18,
+        "prompt": "# Binary Search in Python with Error Handling\n\nHere's a complete implementation of binary search with robust error handling:\n\n```python\ndef binary_search(sorted_list, target):\n    \"\"\"\n    Perform binary search on a",
+        "prompt_tokens": 226,
+        "completion_tokens": 100,
+        "total_tokens": 326,
+        "wall_s": 2.5596040000091307,
+        "prefill_tok_s": 947.1205022253141,
+        "decode_tok_s": 43.21965699151425,
+        "error": null
+      },
+      {
+        "turn": 19,
+        "prompt": "# TCP vs UDP: Key Differences and Use Cases\n\n## Overview\n\n**TCP (Transmission Control Protocol)** and **UDP (User Datagram Protocol)** are both transport layer protocols used for communication over the internet. While they",
+        "prompt_tokens": 217,
+        "completion_tokens": 100,
+        "total_tokens": 317,
+        "wall_s": 2.4593922499916516,
+        "prefill_tok_s": 968.4387161269591,
+        "decode_tok_s": 44.886244789829135,
+        "error": null
+      },
+      {
+        "turn": 20,
+        "prompt": "",
+        "prompt_tokens": 240,
+        "completion_tokens": 100,
+        "total_tokens": 340,
+        "wall_s": 2.4803877910017036,
+        "prefill_tok_s": 1014.2502155281708,
+        "decode_tok_s": 44.72053911504314,
+        "error": null
+      },
+      {
+        "turn": 21,
+        "prompt": "",
+        "prompt_tokens": 245,
+        "completion_tokens": 100,
+        "total_tokens": 345,
+        "wall_s": 2.453036083985353,
+        "prefill_tok_s": 1025.404930314318,
+        "decode_tok_s": 45.32701172609793,
+        "error": null
+      },
+      {
+        "turn": 22,
+        "prompt": "",
+        "prompt_tokens": 244,
+        "completion_tokens": 100,
+        "total_tokens": 344,
+        "wall_s": 2.443810333003057,
+        "prefill_tok_s": 1033.3466030847937,
+        "decode_tok_s": 45.46084798119739,
+        "error": null
+      },
+      {
+        "turn": 23,
+        "prompt": "",
+        "prompt_tokens": 245,
+        "completion_tokens": 100,
+        "total_tokens": 345,
+        "wall_s": 2.454285207990324,
+        "prefill_tok_s": 1034.3313575493523,
+        "decode_tok_s": 45.29994908285723,
+        "error": null
+      },
+      {
+        "turn": 24,
+        "prompt": "#",
+        "prompt_tokens": 242,
+        "completion_tokens": 100,
+        "total_tokens": 342,
+        "wall_s": 2.452695165993646,
+        "prefill_tok_s": 1024.598839917016,
+        "decode_tok_s": 45.283538347005944,
+        "error": null
+      },
+      {
+        "turn": 25,
+        "prompt": "",
+        "prompt_tokens": 203,
+        "completion_tokens": 100,
+        "total_tokens": 303,
+        "wall_s": 2.437386792007601,
+        "prefill_tok_s": 913.9162888695801,
+        "decode_tok_s": 45.29697375448044,
+        "error": null
+      }
+    ],
+    "thermal_pressures": [
+      "Nominal"
+    ],
+    "error": null
+  },
+  "idle_baseline": {}
+}

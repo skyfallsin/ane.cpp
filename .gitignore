@@ -8,3 +8,4 @@ test_*.cpp
 
 # Local HuggingFace model downloads
 hf-models/
+bench/__pycache__/

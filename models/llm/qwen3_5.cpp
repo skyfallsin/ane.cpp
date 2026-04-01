@@ -613,7 +613,8 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         return false;
     }
 
-    bool use_blobs = !blob_dir.empty() && !ane_use_int8();
+    const char* no_blob_env = getenv("ANE_NO_BLOBS");
+    bool use_blobs = !blob_dir.empty() && !ane_use_int8() && !(no_blob_env && atoi(no_blob_env));
     LOG("Compiling ANE kernels%s...\n", use_blobs ? " (from blobs)" : (ane_use_int8() ? " (INT8)" : ""));
     char name[256], name2[256], name3[256];
 
