@@ -274,6 +274,10 @@ struct ServeRequest {
     Timer generation_timer;
     bool generation_timer_started = false;
 
+    // Pipelined scheduler: first decode token from prefill thread
+    int pending_decode_token = 0;
+    int pending_decode_pos = 0;
+
     // Incremental text decode state (for streaming)
     std::string prev_decoded;
     std::string emitted_text;
@@ -482,7 +486,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
     std::mutex mu;
     std::condition_variable cv;
     std::vector<std::unique_ptr<ServeRequest>> pending;
-    std::vector<std::unique_ptr<ServeRequest>> active;
+    std::vector<std::unique_ptr<ServeRequest>> prefilled;  // ready for decode after GPU prefill
     fprintf(stderr, "[boot] allocating %d sessions...\n", args.sessions);
     std::vector<std::unique_ptr<Qwen35Model::Session>> available_sessions;
     for (int i = 0; i < args.sessions; i++) {
@@ -525,166 +529,242 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
     fprintf(stderr, "ane.cpp serve: OpenAI-compatible API at http://127.0.0.1:%d/v1\n", args.port);
     fprintf(stderr, "  model: %s, sessions: %d\n", model_name.c_str(), args.sessions);
 
-    fprintf(stderr, "[boot] starting scheduler thread...\n");
-    // Scheduler thread — batched decode with per-token streaming
-    std::thread scheduler([&] {
-        fprintf(stderr, "[boot] scheduler thread running\n");
-        while (true) {
-            std::unique_lock<std::mutex> lock(mu);
-            cv.wait(lock, [&] { return !pending.empty() || !active.empty(); });
-            fprintf(stderr, "[sched] woke: pending=%zu active=%zu avail=%zu\n",
-                    pending.size(), active.size(), available_sessions.size());
+    // =========================================================
+    // Pipelined scheduler: prefill (GPU) overlaps decode (ANE)
+    // =========================================================
+    // Two threads:
+    //   prefill_thread — GPU ggml-metal prefill, one request at a time
+    //   decode_thread  — ANE batched decode, all active sessions in lock-step
+    // This overlaps GPU prefill of request N+1 with ANE decode of requests 1..N.
+    // Thread safety: prefill uses ggml Metal backend, decode uses ANE kernels —
+    // different hardware, no shared mutable model state.
 
-            while (!pending.empty() && !available_sessions.empty()) {
-                auto req = std::move(pending.front());
+    fprintf(stderr, "[boot] starting prefill thread...\n");
+    std::thread prefill_thread([&] {
+        fprintf(stderr, "[boot] prefill thread running\n");
+        while (true) {
+            std::unique_ptr<ServeRequest> req;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] {
+                    return !pending.empty() && !available_sessions.empty();
+                });
+                req = std::move(pending.front());
                 pending.erase(pending.begin());
                 req->session = std::move(available_sessions.back());
                 available_sessions.pop_back();
-                model.reset_session(*req->session);
-                active.push_back(std::move(req));
             }
 
-            if (active.empty()) {
-                fprintf(stderr, "[sched] no active requests, waiting...\n");
+            model.reset_session(*req->session);
+
+            // Tokenize: apply chat template
+            std::string formatted;
+            if (tokenizer.has_chat_template()) {
+                formatted = tokenizer.apply_chat_template(
+                    req->messages, true, req->enable_thinking);
+            } else {
+                for (auto& [role, content] : req->messages) {
+                    (void)role;
+                    formatted += content + "\n";
+                }
+            }
+            req->prompt_tokens = tokenizer.encode(formatted);
+
+            // Truncate to fit context
+            int max_context = 8192;
+            int reserve_for_gen = (req->max_tokens > 0)
+                ? std::min(req->max_tokens, max_context / 2) : max_context / 2;
+            int max_prompt = max_context - reserve_for_gen;
+            if ((int)req->prompt_tokens.size() > max_prompt) {
+                int drop = (int)req->prompt_tokens.size() - max_prompt;
+                fprintf(stderr, "[prefill] truncating %s: %d -> %d tokens (dropped %d)\n",
+                        req->request_id.c_str(), (int)req->prompt_tokens.size(), max_prompt, drop);
+                req->prompt_tokens.erase(req->prompt_tokens.begin(),
+                                         req->prompt_tokens.begin() + drop);
+            }
+            req->prompt_token_count = (int)req->prompt_tokens.size();
+            req->sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
+
+            fprintf(stderr, "[prefill] %s: %d tokens...\n",
+                    req->request_id.c_str(), (int)req->prompt_tokens.size());
+
+            // GPU prefill (ggml-metal path)
+            Timer prefill_timer;
+            req->logits = model.prefill(*req->session, req->prompt_tokens, 0);
+
+            if (!req->logits) {
+                finish_request(tokenizer, *req, "prefill failed");
+                std::lock_guard<std::mutex> lock(mu);
+                available_sessions.push_back(std::move(req->session));
+                cv.notify_all();
                 continue;
             }
 
-            fprintf(stderr, "[sched] processing batch of %zu\n", active.size());
-            auto batch = std::move(active);
-            active.clear();
-            lock.unlock();
+            req->prompt_tps = req->prompt_tokens.empty()
+                ? 0.0
+                : req->prompt_tokens.size() / (prefill_timer.elapsed_ms() / 1000.0);
 
-            std::vector<std::unique_ptr<ServeRequest>> next_active;
-            std::vector<int> decode_tokens;
-            std::vector<int> decode_positions;
-
-            for (auto& req : batch) {
-                if (!req->logits) {
-                    // Prefill: apply chat template to messages
-                    std::string formatted;
-                    if (tokenizer.has_chat_template()) {
-                        formatted = tokenizer.apply_chat_template(
-                            req->messages, true, req->enable_thinking);
-                    } else {
-                        for (auto& [role, content] : req->messages) {
-                            (void)role;
-                            formatted += content + "\n";
-                        }
-                    }
-                    req->prompt_tokens = tokenizer.encode(formatted);
-                    // Truncate to fit context: keep last (max_context - max_gen) tokens
-                    int max_context = 8192;
-                    int reserve_for_gen = (req->max_tokens > 0)
-                        ? std::min(req->max_tokens, max_context / 2) : max_context / 2;
-                    int max_prompt = max_context - reserve_for_gen;
-                    if ((int)req->prompt_tokens.size() > max_prompt) {
-                        int drop = (int)req->prompt_tokens.size() - max_prompt;
-                        fprintf(stderr, "[sched] truncating %s: %d -> %d tokens (dropped %d from front)\n",
-                                req->request_id.c_str(), (int)req->prompt_tokens.size(), max_prompt, drop);
-                        req->prompt_tokens.erase(req->prompt_tokens.begin(),
-                                                 req->prompt_tokens.begin() + drop);
-                    }
-                    req->prompt_token_count = (int)req->prompt_tokens.size();
-                    req->sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
-                    fprintf(stderr, "[sched] prefilling %s: %d tokens...\n",
-                            req->request_id.c_str(), (int)req->prompt_tokens.size());
-                    Timer prefill_timer;
-                    req->logits = model.prefill(*req->session, req->prompt_tokens, 0);
-                    if (!req->logits) {
-                        finish_request(tokenizer, *req, "prefill failed");
-                        std::lock_guard<std::mutex> done_lock(mu);
-                        available_sessions.push_back(std::move(req->session));
-                        continue;
-                    }
-                    req->prompt_tps = req->prompt_tokens.empty()
-                        ? 0.0
-                        : req->prompt_tokens.size() / (prefill_timer.elapsed_ms() / 1000.0);
-                }
-
-                int limit = (req->max_tokens > 0) ? req->max_tokens : INT_MAX;
-                bool done = false;
-                if ((int)req->generated_tokens.size() >= limit) {
+            // Sample first token from prefill logits
+            int limit = (req->max_tokens > 0) ? req->max_tokens : INT_MAX;
+            bool done = false;
+            if ((int)req->generated_tokens.size() >= limit) {
+                done = true;
+            } else {
+                req->generation_timer.reset();
+                req->generation_timer_started = true;
+                int next_token = sample_token(req->logits, req->sampler_vocab,
+                                              req->sampling, req->generated_tokens);
+                if (is_stop_token(next_token, tokenizer)) {
                     done = true;
                 } else {
-                    if (!req->generation_timer_started) {
-                        req->generation_timer.reset();
-                        req->generation_timer_started = true;
-                    }
-                    int next_token = sample_token(req->logits, req->sampler_vocab,
-                                                  req->sampling, req->generated_tokens);
-                    if (is_stop_token(next_token, tokenizer)) {
+                    emit_token_to_client(tokenizer, *req, next_token);
+                    if ((int)req->generated_tokens.size() >= limit) {
                         done = true;
                     } else {
-                        emit_token_to_client(tokenizer, *req, next_token);
-                        if ((int)req->generated_tokens.size() < limit) {
-                            decode_tokens.push_back(next_token);
-                            decode_positions.push_back(
-                                req->prompt_token_count +
-                                (int)req->generated_tokens.size() - 1);
-                        } else {
-                            done = true;
-                        }
+                        // Hand off to decode thread with first decode token
+                        req->pending_decode_token = next_token;
+                        req->pending_decode_pos = req->prompt_token_count +
+                            (int)req->generated_tokens.size() - 1;
+                        req->logits = nullptr;  // decode thread will set via forward_batch
                     }
-                }
-
-                if (done) {
-                    finish_request(tokenizer, *req);
-                    std::lock_guard<std::mutex> done_lock(mu);
-                    available_sessions.push_back(std::move(req->session));
-                } else {
-                    next_active.push_back(std::move(req));
                 }
             }
 
-            if (!next_active.empty()) {
-                bool decode_ok = true;
-                if (next_active.size() == 1) {
-                    auto& req = next_active[0];
-                    req->logits = model.forward(*req->session,
-                                                decode_tokens[0], decode_positions[0]);
-                    decode_ok = (req->logits != nullptr);
-                } else {
-                    std::vector<Qwen35Model::Session*> sessions;
-                    sessions.reserve(next_active.size());
-                    for (auto& req : next_active)
-                        sessions.push_back(req->session.get());
-                    decode_ok = model.forward_batch(
-                        sessions.data(), decode_tokens.data(),
-                        decode_positions.data(), (int)next_active.size());
-                    if (decode_ok) {
-                        for (auto& req : next_active)
-                            req->logits = req->session->logits;
+            if (done) {
+                finish_request(tokenizer, *req);
+                std::lock_guard<std::mutex> lock(mu);
+                available_sessions.push_back(std::move(req->session));
+                cv.notify_all();
+            } else {
+                fprintf(stderr, "[prefill] %s done (%.1f tok/s), handing to decode\n",
+                        req->request_id.c_str(), req->prompt_tps);
+                std::lock_guard<std::mutex> lock(mu);
+                prefilled.push_back(std::move(req));
+                cv.notify_all();
+            }
+        }
+    });
+    prefill_thread.detach();
+
+    fprintf(stderr, "[boot] starting decode thread...\n");
+    std::thread decode_thread([&] {
+        fprintf(stderr, "[boot] decode thread running\n");
+        std::vector<std::unique_ptr<ServeRequest>> decode_batch;
+
+        while (true) {
+            // Phase 1: Merge newly prefilled requests into decode batch
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                if (decode_batch.empty() && prefilled.empty()) {
+                    cv.wait(lock, [&] { return !prefilled.empty(); });
+                }
+                for (auto& req : prefilled) {
+                    fprintf(stderr, "[decode] +%s (batch now %zu)\n",
+                            req->request_id.c_str(), decode_batch.size() + 1);
+                    decode_batch.push_back(std::move(req));
+                }
+                prefilled.clear();
+            }
+
+            if (decode_batch.empty()) continue;
+
+            // Phase 2: Sample from requests that have logits (continuing decode),
+            //          collect decode tokens for all requests
+            std::vector<int> decode_tokens;
+            std::vector<int> decode_positions;
+            std::vector<std::unique_ptr<ServeRequest>> next_batch;
+
+            for (auto& req : decode_batch) {
+                if (req->logits) {
+                    // Continuing decode — sample from previous forward_batch logits
+                    int limit = (req->max_tokens > 0) ? req->max_tokens : INT_MAX;
+                    bool done = false;
+                    if ((int)req->generated_tokens.size() >= limit) {
+                        done = true;
                     } else {
-                        fprintf(stderr, "Batched decode failed, falling back to sequential\n");
-                        for (size_t i = 0; i < next_active.size(); i++) {
-                            auto& req = next_active[i];
-                            req->logits = model.forward(*req->session,
-                                                        decode_tokens[i], decode_positions[i]);
-                            if (!req->logits) {
-                                finish_request(tokenizer, *req, "generation failed");
-                                std::lock_guard<std::mutex> done_lock(mu);
-                                available_sessions.push_back(std::move(req->session));
+                        int next_token = sample_token(req->logits, req->sampler_vocab,
+                                                      req->sampling, req->generated_tokens);
+                        if (is_stop_token(next_token, tokenizer)) {
+                            done = true;
+                        } else {
+                            emit_token_to_client(tokenizer, *req, next_token);
+                            if ((int)req->generated_tokens.size() >= limit) {
+                                done = true;
+                            } else {
+                                decode_tokens.push_back(next_token);
+                                decode_positions.push_back(
+                                    req->prompt_token_count +
+                                    (int)req->generated_tokens.size() - 1);
                             }
                         }
                     }
-                }
 
-                std::lock_guard<std::mutex> done_lock(mu);
-                for (auto& req : next_active) {
-                    if (!req->session) continue;
-                    if (!req->logits) {
-                        finish_request(tokenizer, *req, "generation failed");
+                    if (done) {
+                        finish_request(tokenizer, *req);
+                        std::lock_guard<std::mutex> lock(mu);
                         available_sessions.push_back(std::move(req->session));
+                        cv.notify_all();
                         continue;
                     }
-                    active.push_back(std::move(req));
+                } else {
+                    // Just arrived from prefill thread — use stored decode token
+                    decode_tokens.push_back(req->pending_decode_token);
+                    decode_positions.push_back(req->pending_decode_pos);
+                }
+                next_batch.push_back(std::move(req));
+            }
+            decode_batch.clear();
+
+            if (next_batch.empty()) continue;
+
+            // Phase 3: ANE batched decode
+            if (next_batch.size() == 1) {
+                auto& req = next_batch[0];
+                req->logits = model.forward(*req->session,
+                                            decode_tokens[0], decode_positions[0]);
+            } else {
+                std::vector<Qwen35Model::Session*> sessions;
+                sessions.reserve(next_batch.size());
+                for (auto& req : next_batch)
+                    sessions.push_back(req->session.get());
+                bool ok = model.forward_batch(
+                    sessions.data(), decode_tokens.data(),
+                    decode_positions.data(), (int)next_batch.size());
+                if (ok) {
+                    for (auto& req : next_batch)
+                        req->logits = req->session->logits;
+                } else {
+                    fprintf(stderr, "[decode] batched decode failed, falling back to sequential\n");
+                    for (size_t i = 0; i < next_batch.size(); i++) {
+                        auto& req = next_batch[i];
+                        req->logits = model.forward(*req->session,
+                                                    decode_tokens[i], decode_positions[i]);
+                        if (!req->logits) {
+                            finish_request(tokenizer, *req, "generation failed");
+                            std::lock_guard<std::mutex> lock(mu);
+                            available_sessions.push_back(std::move(req->session));
+                            cv.notify_all();
+                        }
+                    }
                 }
             }
 
-            cv.notify_all();
+            // Phase 4: Return surviving requests to decode_batch
+            for (auto& req : next_batch) {
+                if (!req || !req->session) continue;
+                if (!req->logits) {
+                    finish_request(tokenizer, *req, "generation failed");
+                    std::lock_guard<std::mutex> lock(mu);
+                    available_sessions.push_back(std::move(req->session));
+                    cv.notify_all();
+                } else {
+                    decode_batch.push_back(std::move(req));
+                }
+            }
+            // Don't wait — loop immediately to check for new prefilled + continue decode
         }
     });
-    scheduler.detach();
+    decode_thread.detach();
     fprintf(stderr, "[boot] entering accept loop\n");
 
     // Accept loop — parse HTTP requests and route
