@@ -849,7 +849,8 @@ def _power_windows_from_samples(samples: list, wall_start: float,
     return windows
 
 
-def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SESSIONS):
+def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SESSIONS,
+                      context_length: int = 32768):
     """Start ane.cpp serve mode. Returns (proc, display_name) or raises."""
     display_name, model_dir, env_vars = MODEL_CONFIGS[config_key]
     model_path = MODELS_DIR / model_dir
@@ -862,6 +863,7 @@ def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SE
         "--model", str(model_path),
         "--port", str(port),
         "--sessions", str(n_sessions),
+        "--context", str(context_length),
         "--temp", "0.7",
     ]
     log = tempfile.NamedTemporaryFile(delete=False, suffix=".log", mode="w")
@@ -872,7 +874,7 @@ def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SE
     return proc, display_name, log.name
 
 
-def _start_llama_server(config_key: str, port: int):
+def _start_llama_server(config_key: str, port: int, context_length: int = 32768):
     """Start llama-server. Returns (proc, display_name) or raises."""
     if not LLAMA_SERVER.exists():
         raise FileNotFoundError(f"llama-server not found: {LLAMA_SERVER}")
@@ -891,7 +893,7 @@ def _start_llama_server(config_key: str, port: int):
         "-m", str(gguf_path),
         "--port", str(port),
         "-ngl", str(ngl),
-        "-c", "8192",
+        "-c", str(context_length),
         "--temp", "0.7",
     ]
     log = tempfile.NamedTemporaryFile(delete=False, suffix=".log", mode="w")
@@ -913,7 +915,7 @@ def _run_conversation_worker(worker_id: int, port: int, deadline: float,
 
     while time.monotonic() < deadline:
         prompt_text = TURN_PROMPTS[(turn_num + prompt_offset) % len(TURN_PROMPTS)]
-        messages = conversation[-8:] + [{"role": "user", "content": prompt_text}]
+        messages = conversation + [{"role": "user", "content": prompt_text}]
 
         turn_num += 1
         per_turn_timeout = min(90, max(30, int(deadline - time.monotonic())))
@@ -943,11 +945,13 @@ def run_sustained(config_key: str, duration_min: float = 5.0,
                   max_tokens: int = 200, port: int = SUSTAINED_PORT,
                   save: bool = False,
                   backend: str = "ane",
-                  n_parallel: int = 1) -> SustainedResult:
+                  n_parallel: int = 1,
+                  context_length: int = 32768) -> SustainedResult:
     """Run a sustained multi-turn workload with continuous power monitoring.
     
     backend: "ane" for ane.cpp serve, "llama" for llama-server
     n_parallel: number of concurrent conversation streams
+    context_length: context window size for ane.cpp server
     """
     par_label = f" \u00d7{n_parallel}" if n_parallel > 1 else ""
     result = SustainedResult(config=f"{config_key} ({backend}{par_label})", duration_min=duration_min)
@@ -955,10 +959,12 @@ def run_sustained(config_key: str, duration_min: float = 5.0,
     # --- Start server ---
     try:
         if backend == "llama":
-            server_proc, display_name, log_path = _start_llama_server(config_key, port)
+            server_proc, display_name, log_path = _start_llama_server(config_key, port,
+                                                                      context_length=context_length)
         else:
             n_sessions = max(n_parallel, SUSTAINED_SESSIONS)
-            server_proc, display_name, log_path = _start_ane_server(config_key, port, n_sessions=n_sessions)
+            server_proc, display_name, log_path = _start_ane_server(config_key, port, n_sessions=n_sessions,
+                                                                    context_length=context_length)
     except FileNotFoundError as e:
         result.error = str(e)
         return result
@@ -1277,6 +1283,8 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                         help="llama.cpp model config for --compare (e.g. 4B-Q8_0)")
     parser.add_argument("--compare", action="store_true",
                         help="Run sustained on both ane.cpp and llama.cpp, show side-by-side")
+    parser.add_argument("--context", type=int, default=32768,
+                        help="Context window size for ane.cpp (default: 32768)")
     args = parser.parse_args()
 
     # Default to --quick if nothing specified
@@ -1326,6 +1334,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 max_tokens=args.max_gen, port=args.port,
                 backend="ane",
                 n_parallel=args.parallel,
+                context_length=args.context,
             )
             print_sustained_report(r_ane, idle)
 
@@ -1346,6 +1355,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 max_tokens=args.max_gen, port=args.port + 1,
                 backend="llama",
                 n_parallel=1,  # llama.cpp baseline always single-stream
+                context_length=args.context,
             )
             print_sustained_report(r_llama, idle)
 
@@ -1382,6 +1392,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 max_tokens=args.max_gen, port=args.port,
                 backend=backend,
                 n_parallel=args.parallel,
+                context_length=args.context,
             )
             print_sustained_report(r, idle)
             if args.save:

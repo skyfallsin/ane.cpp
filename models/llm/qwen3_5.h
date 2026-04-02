@@ -162,6 +162,8 @@ public:
     void reset_session(Session& session) const;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
+    void set_context_length(int ctx) { max_seq_len_ = ctx; kv_capacity_ = ctx; }
+    int context_length() const { return kv_capacity_; }
 
     // Per-batch-item CPU work for forward_batch (DeltaNet SSM or full attention)
     void forward_batch_cpu_item(Session& session, int L, bool is_linear,
@@ -194,8 +196,8 @@ private:
     bool attn_output_gate_ = true;
     bool tie_word_embeddings_ = true;
 
-    static constexpr int MAX_SEQ_LEN = 4096;
-    static constexpr int KV_CACHE_CAPACITY = 2048;
+    int max_seq_len_ = 32768;
+    int kv_capacity_ = 32768;
     static constexpr int LM_HEAD_ANE_CHUNK_MAX = 65536;
 
     std::vector<LayerType> layer_types_;

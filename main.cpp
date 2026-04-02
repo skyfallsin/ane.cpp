@@ -57,6 +57,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
     fprintf(stderr, "  --port N          Server port for serve mode (default: 8088)\n");
     fprintf(stderr, "  --sessions N      Session pool size for serve mode (default: 4)\n");
+    fprintf(stderr, "  --context N       Context window size in tokens (default: 32768)\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s generate --model /path/to/Qwen3.5-0.8B --prompt \"Hello\" --max-tokens 50\n", prog);
@@ -78,6 +79,7 @@ struct Args {
     bool enable_thinking = false;
     int port = 8088;
     int sessions = 4;
+    int context = 32768;
 };
 
 static Args parse_args(int argc, char* argv[], int start) {
@@ -109,6 +111,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sessions") == 0 && i + 1 < argc) {
             args.sessions = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
+            args.context = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -571,7 +575,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
             req->prompt_tokens = tokenizer.encode(formatted);
 
             // Truncate to fit context
-            int max_context = 8192;
+            int max_context = model.context_length();
             int reserve_for_gen = (req->max_tokens > 0)
                 ? std::min(req->max_tokens, max_context / 2) : max_context / 2;
             int max_prompt = max_context - reserve_for_gen;
@@ -1117,7 +1121,7 @@ int main(int argc, char* argv[]) {
     Tokenizer draft_tokenizer;
     DraftModelContext draft_ctx{};
     try {
-        auto result = load(args.model_dir, args.ane_cache);
+        auto result = load(args.model_dir, args.ane_cache, args.context);
         model = std::move(result.first);
         tokenizer = std::move(result.second);
         if (args.draft_model_dir) {

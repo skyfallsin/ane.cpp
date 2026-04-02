@@ -10,7 +10,7 @@ namespace ane_lm {
 using json = nlohmann::json;
 
 std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
-    const std::string& model_dir, bool ane_cache)
+    const std::string& model_dir, bool ane_cache, int context_length)
 {
     Timer timer;
 
@@ -32,6 +32,15 @@ std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
         model = std::make_unique<Qwen3Model>();
     } else {
         throw std::runtime_error("Unsupported model_type: " + model_type);
+    }
+
+    // Set context length before model loads (allocates rope tables + KV cache)
+    if (context_length > 0) {
+        auto* qwen35 = dynamic_cast<Qwen35Model*>(model.get());
+        if (qwen35) {
+            qwen35->set_context_length(context_length);
+            LOG("Context length set to %d\n", context_length);
+        }
     }
 
     // Set ANE cache preference before model loads

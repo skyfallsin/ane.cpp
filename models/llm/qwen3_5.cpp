@@ -335,8 +335,8 @@ bool Qwen35Model::init_session(Session& session) const {
 
     for (int L = 0; L < num_layers_; L++) {
         if (layer_types_[L] == LayerType::FullAttention) {
-            session.kv_k_cache[L] = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
-            session.kv_v_cache[L] = (float*)calloc((size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_, sizeof(float));
+            session.kv_k_cache[L] = (float*)calloc((size_t)kv_capacity_ * num_kv_heads_ * head_dim_, sizeof(float));
+            session.kv_v_cache[L] = (float*)calloc((size_t)kv_capacity_ * num_kv_heads_ * head_dim_, sizeof(float));
             if (!session.kv_k_cache[L] || !session.kv_v_cache[L]) return false;
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
@@ -362,8 +362,8 @@ void Qwen35Model::reset_session(Session& session) const {
         if (layer_types_[L] == LayerType::FullAttention) {
             session.kv_len[L] = 0;
             session.kv_start[L] = 0;
-            memset(session.kv_k_cache[L], 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
-            memset(session.kv_v_cache[L], 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
+            memset(session.kv_k_cache[L], 0, (size_t)kv_capacity_ * num_kv_heads_ * head_dim_ * sizeof(float));
+            memset(session.kv_v_cache[L], 0, (size_t)kv_capacity_ * num_kv_heads_ * head_dim_ * sizeof(float));
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
             memset(session.delta_ssm_state[L], 0, (size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
@@ -450,8 +450,8 @@ bool Qwen35Model::load(const std::string& model_dir) {
     // 3. Init ANE
     ane_init();
 
-    rope_cos_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
-    rope_sin_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
+    rope_cos_ = (float*)calloc((size_t)max_seq_len_ * (rot_dim_ / 2), sizeof(float));
+    rope_sin_ = (float*)calloc((size_t)max_seq_len_ * (rot_dim_ / 2), sizeof(float));
 
     // Precompute RoPE trig table
     if (rope_cos_ && rope_sin_) {
@@ -460,7 +460,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
         for (int j2 = 0, i = 0; i < rot_dim_; i += 2, j2++) {
             inv_freq[j2] = 1.0f / powf(rope_theta_, (float)i / (float)rot_dim_);
         }
-        for (int pos = 0; pos < MAX_SEQ_LEN; pos++) {
+        for (int pos = 0; pos < max_seq_len_; pos++) {
             float* cos_row = rope_cos_ + (size_t)pos * half_rot;
             float* sin_row = rope_sin_ + (size_t)pos * half_rot;
             for (int j2 = 0; j2 < half_rot; j2++) {
@@ -951,7 +951,7 @@ bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, floa
 
     const float* rope_cos_row = nullptr;
     const float* rope_sin_row = nullptr;
-    if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+    if (pos >= 0 && pos < max_seq_len_ && rope_cos_ && rope_sin_) {
         int half_rot = rot_dim_ / 2;
         rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
         rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
@@ -961,14 +961,14 @@ bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, floa
                       rope_cos_row, rope_sin_row);
 
     int slot;
-    if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+    if (session.kv_len[L] < kv_capacity_) {
         slot = session.kv_start[L] + session.kv_len[L];
-        if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+        if (slot >= kv_capacity_) slot -= kv_capacity_;
         session.kv_len[L]++;
     } else {
         slot = session.kv_start[L];
         session.kv_start[L]++;
-        if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+        if (session.kv_start[L] >= kv_capacity_) session.kv_start[L] = 0;
     }
     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
     memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
@@ -976,7 +976,7 @@ bool Qwen35Model::forward_full_attn_core(Session& session, int L, float* x, floa
 
     gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
                   num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                  session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+                  session.kv_start[L], session.kv_len[L], kv_capacity_);
 
     if (attn_output_gate_) {
         for (int h = 0; h < num_q_heads_; h++) {
@@ -1138,7 +1138,7 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
 
                     const float* rope_cos_row = nullptr;
                     const float* rope_sin_row = nullptr;
-                    if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                    if (pos >= 0 && pos < max_seq_len_ && rope_cos_ && rope_sin_) {
                         int half_rot = rot_dim_ / 2;
                         rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
                         rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
@@ -1148,14 +1148,14 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
                                       rope_cos_row, rope_sin_row);
 
                     int slot;
-                    if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                    if (session.kv_len[L] < kv_capacity_) {
                         slot = session.kv_start[L] + session.kv_len[L];
-                        if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                        if (slot >= kv_capacity_) slot -= kv_capacity_;
                         session.kv_len[L]++;
                     } else {
                         slot = session.kv_start[L];
                         session.kv_start[L]++;
-                        if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                        if (session.kv_start[L] >= kv_capacity_) session.kv_start[L] = 0;
                     }
                     size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
                     memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
@@ -1163,7 +1163,7 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
 
                     gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
                                   num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                                  session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+                                  session.kv_start[L], session.kv_len[L], kv_capacity_);
 
                     if (attn_output_gate_) {
                         for (int h = 0; h < num_q_heads_; h++) {
@@ -2247,7 +2247,7 @@ float* Qwen35Model::prefill_gpu_ggml(Session& session, const std::vector<int>& t
 
                 const float* rope_cos_row = nullptr;
                 const float* rope_sin_row = nullptr;
-                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                if (pos >= 0 && pos < max_seq_len_ && rope_cos_ && rope_sin_) {
                     int half_rot = rot_dim_ / 2;
                     rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
                     rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
@@ -2266,14 +2266,14 @@ float* Qwen35Model::prefill_gpu_ggml(Session& session, const std::vector<int>& t
                 memcpy(fullV.data() + (size_t)i * kv_stride, v_raw, kv_stride * sizeof(float));
 
                 int slot;
-                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                if (session.kv_len[L] < kv_capacity_) {
                     slot = session.kv_start[L] + session.kv_len[L];
-                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    if (slot >= kv_capacity_) slot -= kv_capacity_;
                     session.kv_len[L]++;
                 } else {
                     slot = session.kv_start[L];
                     session.kv_start[L]++;
-                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                    if (session.kv_start[L] >= kv_capacity_) session.kv_start[L] = 0;
                 }
                 memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
                 memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
@@ -3137,7 +3137,7 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
 
                 const float* rope_cos_row = nullptr;
                 const float* rope_sin_row = nullptr;
-                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                if (pos >= 0 && pos < max_seq_len_ && rope_cos_ && rope_sin_) {
                     int half_rot = rot_dim_ / 2;
                     rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
                     rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
@@ -3156,14 +3156,14 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
                 memcpy(fullV.data() + (size_t)i * kv_stride, v_raw, kv_stride * sizeof(float));
 
                 int slot;
-                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                if (session.kv_len[L] < kv_capacity_) {
                     slot = session.kv_start[L] + session.kv_len[L];
-                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    if (slot >= kv_capacity_) slot -= kv_capacity_;
                     session.kv_len[L]++;
                 } else {
                     slot = session.kv_start[L];
                     session.kv_start[L]++;
-                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                    if (session.kv_start[L] >= kv_capacity_) session.kv_start[L] = 0;
                 }
                 memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
                 memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
@@ -3505,7 +3505,7 @@ void Qwen35Model::forward_batch_cpu_item(Session& session, int L, bool is_linear
 
         const float* rope_cos_row = nullptr;
         const float* rope_sin_row = nullptr;
-        if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+        if (pos >= 0 && pos < max_seq_len_ && rope_cos_ && rope_sin_) {
             int half_rot = rot_dim_ / 2;
             rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
             rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
@@ -3515,14 +3515,14 @@ void Qwen35Model::forward_batch_cpu_item(Session& session, int L, bool is_linear
                           rope_cos_row, rope_sin_row);
 
         int slot;
-        if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+        if (session.kv_len[L] < kv_capacity_) {
             slot = session.kv_start[L] + session.kv_len[L];
-            if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+            if (slot >= kv_capacity_) slot -= kv_capacity_;
             session.kv_len[L]++;
         } else {
             slot = session.kv_start[L];
             session.kv_start[L]++;
-            if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+            if (session.kv_start[L] >= kv_capacity_) session.kv_start[L] = 0;
         }
         size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
         memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
@@ -3530,7 +3530,7 @@ void Qwen35Model::forward_batch_cpu_item(Session& session, int L, bool is_linear
 
         gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
                       num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                      session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+                      session.kv_start[L], session.kv_len[L], kv_capacity_);
 
         if (attn_output_gate_) {
             for (int h = 0; h < num_q_heads_; h++) {
