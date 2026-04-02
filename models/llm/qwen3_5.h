@@ -4,7 +4,11 @@
 #include "../../core/weight_cache.h"
 #include "../../core/ane_runtime.h"
 #include "../../core/metal_gemm.h"
+#include "../../core/gguf_loader.h"
 #include "../../core/sampling.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -153,6 +157,7 @@ public:
     bool forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch);
     float* prefill(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     float* prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
+    float* prefill_gpu_ggml(Session& session, const std::vector<int>& token_ids, int start_pos = 0);
     std::unique_ptr<Session> create_session() const;
     void reset_session(Session& session) const;
     void reset() override;
@@ -265,6 +270,15 @@ private:
     bool quantize_gpu_weights_int8();  // Quantize fp16 GPU weights to int8
 
     std::vector<LayerANEKernels> ane_layers_;
+
+    // GGUF/ggml-based prefill (replaces custom MPS GEMM + Metal compute shaders)
+    GGUFModel* gguf_model_ = nullptr;         // Owned. Weight tensors in Metal backend.
+    struct GgmlPrefillCtx {
+        ggml_gallocr_t allocator = nullptr;   // Graph allocator for scratch tensors
+        ~GgmlPrefillCtx() { if (allocator) ggml_gallocr_free(allocator); }
+    };
+    std::unique_ptr<GgmlPrefillCtx> ggml_pfx_;
+    bool load_gguf_weights(const std::string& gguf_path, ModelWeights* sf = nullptr);
 
     // LM head ANE kernels
     std::vector<ANEKernel*> lm_head_kernels_;

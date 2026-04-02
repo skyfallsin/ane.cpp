@@ -2,9 +2,15 @@
 #include "../../core/cpu_ops.h"
 #include "../../core/metal_gemm.h"
 #include "../../core/weight_cache.h"
+#include "../../core/gguf_loader.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-metal.h"
 #include <cmath>
 #include <fstream>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <mutex>
 #include <dispatch/dispatch.h>
 #include <arm_fp16.h>
@@ -476,31 +482,67 @@ bool Qwen35Model::load(const std::string& model_dir) {
 
     if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
 
-    // Try to open pre-converted f16 weight cache for zero-copy GPU loading
-    weight_cache_.reset(WeightCache::open(model_dir));
-    if (weight_cache_) {
-        LOG("Using pre-converted f16 weight cache (%d tensors, %.1f MB)\n",
-            weight_cache_->num_entries(), weight_cache_->total_size() / 1e6);
+    // Detect GGUF file for ggml-metal prefill (preferred over MPS path)
+    std::string gguf_path;
+    {
+        // Look for *.gguf files in the model directory
+        // Prefer Q8_0, then any GGUF found
+        namespace fs = std; // just use opendir/readdir
+        DIR* dir = opendir(model_dir.c_str());
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string fname = entry->d_name;
+                if (fname.size() > 5 && fname.substr(fname.size() - 5) == ".gguf") {
+                    std::string candidate = model_dir + "/" + fname;
+                    if (fname.find("Q8_0") != std::string::npos) {
+                        gguf_path = candidate;  // prefer Q8_0
+                        break;
+                    }
+                    if (gguf_path.empty()) {
+                        gguf_path = candidate;  // take first found
+                    }
+                }
+            }
+            closedir(dir);
+        }
     }
 
-    // Load GPU (Metal) fp16 weights for MPS-based prefill
-    if (metal_init()) {
-        bool gpu_ok = false;
+    if (!gguf_path.empty()) {
+        LOG("Found GGUF: %s — using ggml-metal prefill\n", gguf_path.c_str());
+        if (load_gguf_weights(gguf_path, sf.get())) {
+            LOG("GGUF loaded, skipping MPS weight pipeline\n");
+        } else {
+            LOG("GGUF load failed, falling back to MPS pipeline\n");
+            gguf_path.clear();
+        }
+    }
+
+    if (gguf_path.empty()) {
+        // Fallback: MPS-based prefill with safetensors + weight cache
+        weight_cache_.reset(WeightCache::open(model_dir));
         if (weight_cache_) {
-            gpu_ok = load_gpu_weights_from_cache(weight_cache_.get(), sf.get());
-            if (gpu_ok) {
-                LOG("GPU weights loaded via zero-copy cache\n");
-            }
+            LOG("Using pre-converted f16 weight cache (%d tensors, %.1f MB)\n",
+                weight_cache_->num_entries(), weight_cache_->total_size() / 1e6);
         }
-        if (!gpu_ok) {
-            if (!load_gpu_weights(sf.get())) {
-                LOG("GPU weight load failed, GPU prefill unavailable\n");
+
+        if (metal_init()) {
+            bool gpu_ok = false;
+            if (weight_cache_) {
+                gpu_ok = load_gpu_weights_from_cache(weight_cache_.get(), sf.get());
+                if (gpu_ok) {
+                    LOG("GPU weights loaded via zero-copy cache\n");
+                }
             }
-        }
-        // Quantize GPU weights to int8 when ANE_INT8 is enabled
-        if (gpu_weights_loaded_ && ane_use_int8()) {
-            if (quantize_gpu_weights_int8()) {
-                LOG("GPU INT8 weights ready for prefill\n");
+            if (!gpu_ok) {
+                if (!load_gpu_weights(sf.get())) {
+                    LOG("GPU weight load failed, GPU prefill unavailable\n");
+                }
+            }
+            if (gpu_weights_loaded_ && ane_use_int8()) {
+                if (quantize_gpu_weights_int8()) {
+                    LOG("GPU INT8 weights ready for prefill\n");
+                }
             }
         }
     }
@@ -1228,6 +1270,235 @@ float* Qwen35Model::prefill(Session& session, const std::vector<int>& token_ids,
 
 // (CPU prefill path removed — GPU Metal MPS prefill is faster and avoids ~17GB f32 weight copies)
 
+// ============ GGUF Weight Loading (ggml-metal prefill) ============
+
+// Helper: convert BF16 safetensors data to F16 and upload into a ggml Metal tensor.
+// Returns false if the tensor is null or data is missing.
+static bool replace_ggml_tensor_with_safetensors(
+    ggml_tensor* dst, ModelWeights* sf, const char* sf_name, int64_t expected_elems)
+{
+    if (!dst || !sf) return false;
+    const void* bf16_ptr = sf->get_bf16_ptr(sf_name);
+    if (!bf16_ptr) {
+        fprintf(stderr, "[gguf-sf] Missing safetensors tensor: %s\n", sf_name);
+        return false;
+    }
+
+    // Verify size
+    int64_t dst_elems = ggml_nelements(dst);
+    if (dst_elems != expected_elems) {
+        fprintf(stderr, "[gguf-sf] Size mismatch for %s: dst=%lld expected=%lld\n",
+                sf_name, (long long)dst_elems, (long long)expected_elems);
+        return false;
+    }
+
+    // Convert BF16 → F16 (both 2 bytes per element)
+    size_t n = (size_t)dst_elems;
+    std::vector<uint16_t> f16_data(n);
+    const uint16_t* bf16 = (const uint16_t*)bf16_ptr;
+    for (size_t i = 0; i < n; i++) {
+        // BF16 → F32 → F16
+        uint32_t bits = (uint32_t)bf16[i] << 16;
+        float f32;
+        memcpy(&f32, &bits, 4);
+        f16_data[i] = ggml_fp32_to_fp16(f32);
+    }
+
+    // Upload to Metal
+    ggml_backend_tensor_set(dst, f16_data.data(), 0, n * sizeof(uint16_t));
+    return true;
+}
+
+bool Qwen35Model::load_gguf_weights(const std::string& gguf_path, ModelWeights* sf) {
+    // Build layer type vector (0=linear, 1=full)
+    std::vector<int> layer_type_ints(num_layers_);
+    for (int L = 0; L < num_layers_; L++) {
+        layer_type_ints[L] = (layer_types_[L] == LayerType::LinearAttention) ? 0 : 1;
+    }
+
+    gguf_model_ = load_gguf_model(
+        gguf_path, layer_type_ints,
+        hidden_size_, intermediate_size_,
+        num_q_heads_, num_kv_heads_, head_dim_,
+        lin_qkv_dim_, lin_total_val_, lin_num_val_heads_,
+        full_q_dim_, full_kv_dim_, full_out_dim_,
+        vocab_size_, tie_word_embeddings_
+    );
+
+    if (!gguf_model_) {
+        fprintf(stderr, "[gguf] Failed to load GGUF model from %s\n", gguf_path.c_str());
+        return false;
+    }
+
+    // Initialize ggml graph allocator for prefill scratch buffers
+    ggml_pfx_ = std::make_unique<GgmlPrefillCtx>();
+    ggml_pfx_->allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(gguf_model_->metal_backend));
+
+    // Compare GGUF CPU weights against safetensors-loaded ones for validation
+    if (embed_tokens_ && gguf_model_->embed_tokens_f32) {
+        float max_diff = 0;
+        for (int i = 0; i < std::min(2560 * 10, vocab_size_ * hidden_size_); i++) {
+            float d = fabsf(embed_tokens_[i] - gguf_model_->embed_tokens_f32[i]);
+            if (d > max_diff) max_diff = d;
+        }
+        fprintf(stderr, "[gguf] Embed validation: max_diff=%.6e (first 10 rows)\n", max_diff);
+    }
+    if (final_norm_ && gguf_model_->final_norm_f32) {
+        float max_diff = 0;
+        for (int i = 0; i < hidden_size_; i++) {
+            float d = fabsf(final_norm_[i] - gguf_model_->final_norm_f32[i]);
+            if (d > max_diff) max_diff = d;
+        }
+        fprintf(stderr, "[gguf] Final norm validation: max_diff=%.6e\n", max_diff);
+    }
+
+    // ====================================================================
+    // Replace GGUF weight data with safetensors data.
+    //
+    // The GGUF conversion tool reorders DeltaNet SSM weights (A, dt_bias,
+    // conv1d) into llama.cpp conventions that differ from the original
+    // safetensors layout. Since decode uses safetensors/ANE weights,
+    // the ggml prefill must also use safetensors conventions for
+    // session state (SSM, KV cache) to be compatible with decode.
+    //
+    // We keep the GGUF ggml infrastructure (Metal backend, tensor shapes,
+    // allocator) but replace the weight data with safetensors BF16→F16.
+    // ====================================================================
+    if (sf) {
+        fprintf(stderr, "[gguf-sf] Replacing GGUF weight data with safetensors...\n");
+        int replaced = 0;
+        char name[256];
+
+        for (int L = 0; L < num_layers_; L++) {
+            auto& lw = gguf_model_->layers[L];
+            bool is_linear = (layer_types_[L] == LayerType::LinearAttention);
+
+            if (is_linear) {
+                // QKV projection
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
+                if (replace_ggml_tensor_with_safetensors(lw.first_proj, sf, name,
+                        (int64_t)lw.first_proj_rows * hidden_size_)) replaced++;
+
+                // Z projection (gate)
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+                if (lw.z_proj && replace_ggml_tensor_with_safetensors(lw.z_proj, sf, name,
+                        (int64_t)lin_total_val_ * hidden_size_)) replaced++;
+
+                // A projection (alpha)
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
+                if (lw.a_proj && replace_ggml_tensor_with_safetensors(lw.a_proj, sf, name,
+                        (int64_t)lin_num_val_heads_ * hidden_size_)) replaced++;
+
+                // B projection (beta)
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
+                if (lw.b_proj && replace_ggml_tensor_with_safetensors(lw.b_proj, sf, name,
+                        (int64_t)lin_num_val_heads_ * hidden_size_)) replaced++;
+
+                // O projection (SSM output)
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+                if (replace_ggml_tensor_with_safetensors(lw.o_proj, sf, name,
+                        (int64_t)hidden_size_ * lw.o_proj_in)) replaced++;
+            } else {
+                // Full attention: separate Q, K, V in safetensors → concat in ggml
+                if (lw.first_proj) {
+                    // Note: self_attn layers in Qwen3.5 use q_proj/k_proj/v_proj naming
+                    snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
+                    const void* q_bf16 = sf->get_bf16_ptr(name);
+                    snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
+                    const void* k_bf16 = sf->get_bf16_ptr(name);
+                    snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
+                    const void* v_bf16 = sf->get_bf16_ptr(name);
+
+                    if (q_bf16 && k_bf16 && v_bf16) {
+                        int64_t q_elems = (int64_t)full_q_dim_ * hidden_size_;
+                        int64_t k_elems = (int64_t)full_kv_dim_ * hidden_size_;
+                        int64_t v_elems = (int64_t)full_kv_dim_ * hidden_size_;
+
+                        auto bf16_to_f16 = [](std::vector<uint16_t>& out, const void* bf16, size_t n) {
+                            const uint16_t* src = (const uint16_t*)bf16;
+                            out.resize(n);
+                            for (size_t i = 0; i < n; i++) {
+                                uint32_t bits = (uint32_t)src[i] << 16;
+                                float f32;
+                                memcpy(&f32, &bits, 4);
+                                out[i] = ggml_fp32_to_fp16(f32);
+                            }
+                        };
+
+                        std::vector<uint16_t> q_f16, k_f16, v_f16;
+                        bf16_to_f16(q_f16, q_bf16, q_elems);
+                        bf16_to_f16(k_f16, k_bf16, k_elems);
+                        bf16_to_f16(v_f16, v_bf16, v_elems);
+
+                        size_t off = 0;
+                        ggml_backend_tensor_set(lw.first_proj, q_f16.data(), off, q_elems * 2);
+                        off += q_elems * 2;
+                        ggml_backend_tensor_set(lw.first_proj, k_f16.data(), off, k_elems * 2);
+                        off += k_elems * 2;
+                        ggml_backend_tensor_set(lw.first_proj, v_f16.data(), off, v_elems * 2);
+                        replaced++;
+                    }
+                }
+
+                // O projection
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+                if (replace_ggml_tensor_with_safetensors(lw.o_proj, sf, name,
+                        (int64_t)hidden_size_ * lw.o_proj_in)) replaced++;
+            }
+
+            // FFN (same for both layer types)
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
+            if (replace_ggml_tensor_with_safetensors(lw.gate_proj, sf, name,
+                    (int64_t)intermediate_size_ * hidden_size_)) replaced++;
+
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.up_proj.weight", L);
+            if (replace_ggml_tensor_with_safetensors(lw.up_proj, sf, name,
+                    (int64_t)intermediate_size_ * hidden_size_)) replaced++;
+
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+            if (replace_ggml_tensor_with_safetensors(lw.down_proj, sf, name,
+                    (int64_t)hidden_size_ * intermediate_size_)) replaced++;
+
+            // Norm weights (F32) — use already-loaded CPU norms which include +1.0 offset
+            if (layers_[L].input_layernorm && lw.input_norm) {
+                ggml_backend_tensor_set(lw.input_norm, layers_[L].input_layernorm, 0,
+                                        hidden_size_ * sizeof(float));
+                replaced++;
+            }
+            if (layers_[L].post_attention_layernorm && lw.post_norm) {
+                ggml_backend_tensor_set(lw.post_norm, layers_[L].post_attention_layernorm, 0,
+                                        hidden_size_ * sizeof(float));
+                replaced++;
+            }
+        }
+
+        // Also replace Phase 2 CPU weights with safetensors
+        for (int L = 0; L < num_layers_; L++) {
+            auto& cl = gguf_model_->cpu_layers[L];
+            if (layer_types_[L] == LayerType::LinearAttention) {
+                cl.conv1d_w = layers_[L].deltanet.conv1d_w;
+                cl.A = layers_[L].deltanet.A;
+                cl.dt_bias = layers_[L].deltanet.dt_bias;
+                cl.ssm_norm_w = layers_[L].deltanet.norm_w;
+            } else {
+                cl.q_norm = layers_[L].full_attn.q_norm;
+                cl.k_norm = layers_[L].full_attn.k_norm;
+            }
+            cl.input_layernorm = layers_[L].input_layernorm;
+            cl.post_attention_layernorm = layers_[L].post_attention_layernorm;
+        }
+
+        fprintf(stderr, "[gguf-sf] Replaced %d GPU tensors + CPU Phase2 weights with safetensors data\n", replaced);
+    }
+
+    // Mark old GPU weight system as loaded (for fallback detection)
+    gpu_weights_loaded_ = true;
+
+    LOG("[gguf] GGUF model ready for ggml-metal prefill\n");
+    return true;
+}
+
 // ============ GPU Weight Loading ============
 
 bool Qwen35Model::load_gpu_weights(ModelWeights* sf) {
@@ -1691,8 +1962,906 @@ fail:
 //   sync #2: o_proj → residual_add → RMSNorm → gate+up → SwiGLU → down_proj → residual_add
 // = 2 syncs/layer (down from 4)
 
+// ============================================================
+// ggml-metal prefill: replaces custom MPS GEMM + Metal compute
+// shaders with ggml graph computation on quantized GGUF weights.
+// Weight tensors live in GGUFModel's Metal buffer.
+// Activation scratch is managed by ggml_gallocr.
+// ============================================================
+
+float* Qwen35Model::prefill_gpu_ggml(Session& session, const std::vector<int>& token_ids, int start_pos) {
+    Timer total_timer;
+    const int N = (int)token_ids.size();
+    const int H = hidden_size_;
+    const int I = intermediate_size_;
+    const int max_proj = std::max(lin_qkv_dim_ + lin_total_val_, full_q_dim_ + 2 * full_kv_dim_);
+    const int max_attn = std::max(lin_total_val_, full_out_dim_);
+
+    fprintf(stderr, "[ggml_prefill] N=%d H=%d I=%d max_proj=%d max_attn=%d layers=%d\n",
+            N, H, I, max_proj, max_attn, num_layers_);
+
+    auto* gm = gguf_model_;
+    auto* gpc = ggml_pfx_.get();
+    ggml_backend_t metal = gm->metal_backend;
+
+    // CPU buffers — hidden state + attention intermediates
+    std::vector<float> X((size_t)N * H);
+    std::vector<float> Proj((size_t)N * max_proj);
+    std::vector<float> Oproj((size_t)N * max_attn);
+
+    // DeltaNet batch buffers
+    std::vector<float> Z_batch((size_t)N * lin_total_val_);
+    std::vector<float> A_batch((size_t)N * lin_num_val_heads_);
+    std::vector<float> B_batch((size_t)N * lin_num_val_heads_);
+    std::vector<float> conv_batch((size_t)N * lin_qkv_dim_);
+    std::vector<float> Y_batch((size_t)N * lin_total_val_);
+
+    // Full-attention batch buffers
+    std::vector<float> fullK((size_t)N * full_kv_dim_);
+    std::vector<float> fullV((size_t)N * full_kv_dim_);
+    const int fa_nqh = num_q_heads_;
+    std::vector<float> fa_scores((size_t)fa_nqh * N * N);
+    std::vector<float> fa_q_buf((size_t)fa_nqh * N * head_dim_);
+    std::vector<float> fa_k_buf((size_t)num_kv_heads_ * N * head_dim_);
+    std::vector<float> fa_v_buf((size_t)num_kv_heads_ * N * head_dim_);
+    std::vector<float> fa_out_buf((size_t)fa_nqh * N * head_dim_);
+
+    dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    // Embedding lookup from GGUF CPU weights
+    for (int i = 0; i < N; i++) {
+        memcpy(X.data() + (size_t)i * H,
+               embed_tokens_ + (int64_t)token_ids[i] * H,
+               (size_t)H * sizeof(float));
+    }
+
+    double total_gpu_ms = 0, total_attn_ms = 0;
+    double delta_attn_ms = 0, full_attn_ms = 0, total_conv_ms = 0;
+
+    // Debug: limit number of layers for comparison testing
+    static int ggml_max_layers = []() {
+        const char* env = getenv("GGML_MAX_LAYERS");
+        return env ? atoi(env) : 0;
+    }();
+    const int layer_limit = (ggml_max_layers > 0) ? std::min(ggml_max_layers, num_layers_) : num_layers_;
+
+    for (int L = 0; L < layer_limit; L++) {
+        auto& gw = gm->layers[L];
+        const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
+        const int proj_rows = gw.first_proj_rows;
+
+        // ============================================================
+        // Phase 1: ggml graph — RMSNorm + QKV projections
+        // ============================================================
+        Timer phase1_timer;
+        {
+            // Graph context: input + rms_norm + mul(weight) + mul_mat projections
+            // Linear layers need up to 10 tensors (x, norm, scaled, proj, z, a, b + ops)
+            const int max_tensors = 16;
+            size_t ctx_size = ggml_tensor_overhead() * max_tensors + ggml_graph_overhead();
+            ggml_init_params gp = { ctx_size, nullptr, true };
+            ggml_context* ctx = ggml_init(gp);
+
+            // Input: X [H, N] in ggml notation (ne0=H, ne1=N)
+            ggml_tensor* x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
+            ggml_set_name(x_in, "x_in");
+            ggml_set_input(x_in);
+
+            // RMSNorm → scale by norm weight
+            ggml_tensor* normed = ggml_rms_norm(ctx, x_in, rms_eps_);
+            ggml_tensor* normed_scaled = ggml_mul(ctx, normed, gw.input_norm);
+
+            // QKV projection: [H, proj_rows] x [H, N] → [proj_rows, N]
+            ggml_tensor* proj_out = ggml_mul_mat(ctx, gw.first_proj, normed_scaled);
+            ggml_set_name(proj_out, "proj");
+            ggml_set_output(proj_out);
+
+            // Build graph
+            ggml_cgraph* graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, proj_out);
+
+            // Additional projections for linear attention layers
+            ggml_tensor* z_out = nullptr;
+            ggml_tensor* a_out = nullptr;
+            ggml_tensor* b_out = nullptr;
+            if (is_linear) {
+                if (gw.z_proj) {
+                    z_out = ggml_mul_mat(ctx, gw.z_proj, normed_scaled);
+                    ggml_set_output(z_out);
+                    ggml_build_forward_expand(graph, z_out);
+                }
+                if (gw.a_proj) {
+                    a_out = ggml_mul_mat(ctx, gw.a_proj, normed_scaled);
+                    ggml_set_output(a_out);
+                    ggml_build_forward_expand(graph, a_out);
+                }
+                if (gw.b_proj) {
+                    b_out = ggml_mul_mat(ctx, gw.b_proj, normed_scaled);
+                    ggml_set_output(b_out);
+                    ggml_build_forward_expand(graph, b_out);
+                }
+            }
+
+            // Allocate scratch, set input, compute
+            ggml_gallocr_alloc_graph(gpc->allocator, graph);
+            ggml_backend_tensor_set(x_in, X.data(), 0, (size_t)N * H * sizeof(float));
+            ggml_backend_graph_compute(metal, graph);
+
+            // Read projection results to CPU
+            // proj_out is [proj_rows, N] in ggml = contiguous [N, proj_rows] in memory
+            // Proj buffer has stride max_proj, so scatter with stride
+            {
+                std::vector<float> proj_tmp((size_t)N * proj_rows);
+                ggml_backend_tensor_get(proj_out, proj_tmp.data(), 0,
+                                        (size_t)N * proj_rows * sizeof(float));
+                for (int i = 0; i < N; i++) {
+                    memcpy(Proj.data() + (size_t)i * max_proj,
+                           proj_tmp.data() + (size_t)i * proj_rows,
+                           (size_t)proj_rows * sizeof(float));
+                }
+            }
+            if (is_linear) {
+                if (z_out) ggml_backend_tensor_get(z_out, Z_batch.data(), 0,
+                               (size_t)N * lin_total_val_ * sizeof(float));
+                if (a_out) ggml_backend_tensor_get(a_out, A_batch.data(), 0,
+                               (size_t)N * lin_num_val_heads_ * sizeof(float));
+                if (b_out) ggml_backend_tensor_get(b_out, B_batch.data(), 0,
+                               (size_t)N * lin_num_val_heads_ * sizeof(float));
+            }
+
+            ggml_free(ctx);
+        }
+        total_gpu_ms += phase1_timer.elapsed_ms();
+
+        if (L == 0) {
+            fprintf(stderr, "[ggml_prefill] L0 phase1: proj_rows=%d is_linear=%d first_proj=[%lld,%lld] type=%s\n",
+                    proj_rows, is_linear,
+                    (long long)gw.first_proj->ne[0], (long long)gw.first_proj->ne[1],
+                    ggml_type_name(gw.first_proj->type));
+            fprintf(stderr, "  X[0..3] = %.6f %.6f %.6f %.6f\n", X[0], X[1], X[2], X[3]);
+            fprintf(stderr, "  Proj[0..3] = %.6f %.6f %.6f %.6f\n", Proj[0], Proj[1], Proj[2], Proj[3]);
+            // Also compute CPU reference: RMSNorm(X[0]) then dot with first row of weight
+            {
+                std::vector<float> x_normed(H);
+                rmsnorm(x_normed.data(), X.data(), layers_[0].input_layernorm, H, rms_eps_);
+                fprintf(stderr, "  CPU x_normed[0..3] = %.6f %.6f %.6f %.6f\n",
+                        x_normed[0], x_normed[1], x_normed[2], x_normed[3]);
+                // Dequantize first row of the weight matrix for comparison
+                std::vector<float> w_row0(H);
+                const auto* traits = ggml_get_type_traits(gw.first_proj->type);
+                if (traits && traits->to_float) {
+                    // Row 0 starts at offset 0, covers H elements
+                    size_t row_bytes = ggml_row_size(gw.first_proj->type, H);
+                    std::vector<uint8_t> row_data(row_bytes);
+                    ggml_backend_tensor_get(gw.first_proj, row_data.data(), 0, row_bytes);
+                    traits->to_float(row_data.data(), w_row0.data(), H);
+                    // Dot product: sum(x_normed * w_row0)
+                    float dot = 0;
+                    for (int i = 0; i < H; i++) dot += x_normed[i] * w_row0[i];
+                    fprintf(stderr, "  CPU dot(x_normed, w_row0) = %.6f (should match Proj[0])\n", dot);
+                }
+            }
+        }
+
+        // ============================================================
+        // Phase 2: CPU Attention Core (identical to original)
+        // ============================================================
+        Timer attn_timer;
+        if (is_linear) {
+            auto& cl = gm->cpu_layers[L];
+            const int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+            const float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
+
+            Timer conv_timer;
+            for (int i = 0; i < N; i++) {
+                float* mixed_qkv = Proj.data() + (size_t)i * max_proj;
+                float* conv_out_i = conv_batch.data() + (size_t)i * lin_qkv_dim_;
+                conv1d_update(conv_out_i, session.delta_conv_state[L], &session.delta_conv_pos[L],
+                              mixed_qkv, cl.conv1d_w, lin_qkv_dim_, conv_kernel_);
+                silu_vec_inplace(conv_out_i, lin_qkv_dim_, session.scratch_tmp);
+            }
+            total_conv_ms += conv_timer.elapsed_ms();
+
+            const int num_kh = lin_num_heads_;
+            const int key_dim = lin_key_dim_;
+            const int val_dim = lin_val_dim_;
+            const int total_key = lin_total_key_;
+            const int total_val = lin_total_val_;
+            const int num_vh = lin_num_val_heads_;
+            const int qkv_dim = lin_qkv_dim_;
+            float* conv_data = conv_batch.data();
+            float* y_data = Y_batch.data();
+            float* a_data = A_batch.data();
+            float* b_data = B_batch.data();
+            float* oproj_data = Oproj.data();
+            float* z_data = Z_batch.data();
+            float** ssm_states = session.delta_ssm_state.data();
+            const float* dw_A = cl.A;
+            const float* dw_dt_bias = cl.dt_bias;
+            const float* dw_norm_w = cl.ssm_norm_w;
+
+            dispatch_apply((size_t)num_kh, par_queue, ^(size_t kh_idx) {
+                int kh = (int)kh_idx;
+                for (int i = 0; i < N; i++) {
+                    float* conv_out_i = conv_data + (size_t)i * qkv_dim;
+                    float* qh = conv_out_i + kh * key_dim;
+                    float* kh_ptr = conv_out_i + total_key + kh * key_dim;
+
+                    l2_normalize(qh, key_dim);
+                    l2_normalize(kh_ptr, key_dim);
+                    float qs = q_scale;
+                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)key_dim);
+
+                    float* a_vec = a_data + (size_t)i * num_vh;
+                    float* b_vec = b_data + (size_t)i * num_vh;
+
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* vh_ptr = conv_out_i + total_key * 2 + vh * val_dim;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        float* state = ssm_states[L] + (size_t)vh * key_dim * val_dim;
+                        float beta = sigmoid_f(b_vec[vh]);
+                        float decay = expf(-dw_A[vh] * softplus_f(a_vec[vh] + dw_dt_bias[vh]));
+                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, key_dim, val_dim);
+                    }
+
+                    float* pre_oproj = oproj_data + (size_t)i * max_attn;
+                    float* z_ptr = z_data + (size_t)i * total_val;
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        rmsnorm_gated(pre_oproj + vh * val_dim,
+                                      yh,
+                                      z_ptr + vh * val_dim,
+                                      dw_norm_w, val_dim);
+                    }
+                }
+            });
+        } else {
+            // Full attention (CPU — identical to original)
+            auto& cl_fa = gm->cpu_layers[L];
+            const int hd = head_dim_;
+            const int nqh = num_q_heads_;
+            const int nkvh = num_kv_heads_;
+            const int groups = nqh / nkvh;
+            const float scale = 1.0f / sqrtf((float)hd);
+
+            for (int i = 0; i < N; i++) {
+                float* proj = Proj.data() + (size_t)i * max_proj;
+                float* q_gate_raw = proj;
+                float* k_raw = proj + full_q_dim_;
+                int pos = start_pos + i;
+
+                for (int h = 0; h < nqh; h++) {
+                    float* qh = q_gate_raw + (size_t)h * hd * 2;
+                    rmsnorm(qh, qh, cl_fa.q_norm, hd, rms_eps_);
+                }
+                for (int h = 0; h < nkvh; h++) {
+                    rmsnorm(k_raw + h * hd, k_raw + h * hd, cl_fa.k_norm, hd, rms_eps_);
+                }
+
+                const float* rope_cos_row = nullptr;
+                const float* rope_sin_row = nullptr;
+                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+                    int half_rot = rot_dim_ / 2;
+                    rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+                    rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+                }
+                apply_rope_cached(q_gate_raw, k_raw, nqh, nkvh,
+                                  hd, hd * 2, hd, rot_dim_, pos, rope_theta_,
+                                  rope_cos_row, rope_sin_row);
+            }
+
+            const size_t kv_stride = (size_t)nkvh * hd;
+            for (int i = 0; i < N; i++) {
+                float* proj = Proj.data() + (size_t)i * max_proj;
+                float* k_raw = proj + full_q_dim_;
+                float* v_raw = proj + full_q_dim_ + full_kv_dim_;
+                memcpy(fullK.data() + (size_t)i * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(fullV.data() + (size_t)i * kv_stride, v_raw, kv_stride * sizeof(float));
+
+                int slot;
+                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+                    slot = session.kv_start[L] + session.kv_len[L];
+                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+                    session.kv_len[L]++;
+                } else {
+                    slot = session.kv_start[L];
+                    session.kv_start[L]++;
+                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+                }
+                memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+                memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+            }
+
+            for (int kvh = 0; kvh < nkvh; kvh++) {
+                float* kb = fa_k_buf.data() + (size_t)kvh * N * hd;
+                float* vb = fa_v_buf.data() + (size_t)kvh * N * hd;
+                for (int i = 0; i < N; i++) {
+                    memcpy(kb + (size_t)i * hd, fullK.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                    memcpy(vb + (size_t)i * hd, fullV.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                }
+            }
+
+            float* proj_data = Proj.data();
+            float* oproj_data = Oproj.data();
+            const bool do_gate = attn_output_gate_;
+            const int total_q_heads = nqh;
+            float* fa_s = fa_scores.data();
+            float* fa_q = fa_q_buf.data();
+            float* fa_kb = fa_k_buf.data();
+            float* fa_vb = fa_v_buf.data();
+            float* fa_o = fa_out_buf.data();
+
+            dispatch_apply((size_t)total_q_heads, par_queue, ^(size_t h_idx) {
+                int h = (int)h_idx;
+                int kvh = h / groups;
+                const size_t NN = (size_t)N * N;
+                const size_t Nhd = (size_t)N * hd;
+
+                float* scores = fa_s + h * NN;
+                float* q_buf = fa_q + h * Nhd;
+                float* out_buf = fa_o + h * Nhd;
+                const float* k_buf = fa_kb + (size_t)kvh * Nhd;
+                const float* v_buf = fa_vb + (size_t)kvh * Nhd;
+
+                for (int i = 0; i < N; i++) {
+                    memcpy(q_buf + (size_t)i * hd,
+                           proj_data + (size_t)i * max_proj + (size_t)h * hd * 2,
+                           (size_t)hd * sizeof(float));
+                }
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            N, N, hd, scale,
+                            q_buf, hd, k_buf, hd,
+                            0.0f, scores, N);
+
+                for (int i = 0; i < N; i++) {
+                    float* row = scores + (size_t)i * N;
+                    for (int j = i + 1; j < N; j++) row[j] = -1e9f;
+                    softmax(row, N);
+                }
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            N, hd, N, 1.0f,
+                            scores, N, v_buf, hd,
+                            0.0f, out_buf, hd);
+
+                float tmp[256];
+                for (int i = 0; i < N; i++) {
+                    float* dst = oproj_data + (size_t)i * max_attn + (size_t)h * hd;
+                    float* src = out_buf + (size_t)i * hd;
+                    if (do_gate) {
+                        const float* gh = proj_data + (size_t)i * max_proj + (size_t)h * hd * 2 + hd;
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
+                        mul_sigmoid_inplace(dst, gh, hd, tmp);
+                    } else {
+                        memcpy(dst, src, (size_t)hd * sizeof(float));
+                    }
+                }
+            });
+        }
+        double layer_attn = attn_timer.elapsed_ms();
+        total_attn_ms += layer_attn;
+        if (is_linear) delta_attn_ms += layer_attn;
+        else full_attn_ms += layer_attn;
+
+        // ============================================================
+        // Phase 3: ggml graph — o_proj + residual + FFN chain
+        // ============================================================
+
+        // --- Isolated o_proj mul_mat test (layer 0 only) ---
+        if (L == 0) {
+            auto& gw0 = gm->layers[0];
+            const int test_attn_dim = gw0.o_proj_in;
+
+            // Create a fresh context and allocator for isolation
+            const int test_tensors = 4;
+            size_t test_ctx_size = ggml_tensor_overhead() * test_tensors + ggml_graph_overhead();
+            ggml_init_params test_gp = { test_ctx_size, nullptr, true };
+            ggml_context* test_ctx = ggml_init(test_gp);
+
+            ggml_tensor* test_in = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, test_attn_dim, N);
+            ggml_set_name(test_in, "test_in");
+            ggml_set_input(test_in);
+
+            ggml_tensor* test_out = ggml_mul_mat(test_ctx, gw0.o_proj, test_in);
+            ggml_set_name(test_out, "test_out");
+            ggml_set_output(test_out);
+
+            ggml_cgraph* test_graph = ggml_new_graph(test_ctx);
+            ggml_build_forward_expand(test_graph, test_out);
+
+            // Use a separate allocator to avoid any cross-contamination
+            ggml_gallocr_t test_alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(metal));
+            ggml_gallocr_alloc_graph(test_alloc, test_graph);
+
+            // Pack oproj data (same packing as Phase 3)
+            {
+                std::vector<float> oproj_packed((size_t)N * test_attn_dim);
+                for (int i = 0; i < N; i++) {
+                    memcpy(oproj_packed.data() + (size_t)i * test_attn_dim,
+                           Oproj.data() + (size_t)i * max_attn,
+                           (size_t)test_attn_dim * sizeof(float));
+                }
+                ggml_backend_tensor_set(test_in, oproj_packed.data(), 0,
+                                        (size_t)N * test_attn_dim * sizeof(float));
+            }
+
+            ggml_backend_graph_compute(metal, test_graph);
+
+            // Read back and compare with CPU reference
+            std::vector<float> test_result((size_t)N * H);
+            ggml_backend_tensor_get(test_out, test_result.data(), 0, (size_t)N * H * sizeof(float));
+
+            // CPU reference dot product
+            std::vector<float> oproj_packed_ref((size_t)N * test_attn_dim);
+            ggml_backend_tensor_get(test_in, oproj_packed_ref.data(), 0,
+                                    (size_t)N * test_attn_dim * sizeof(float));
+            size_t w_row_bytes = ggml_row_size(gw0.o_proj->type, test_attn_dim);
+            std::vector<uint8_t> w_row_raw(w_row_bytes);
+            ggml_backend_tensor_get(gw0.o_proj, w_row_raw.data(), 0, w_row_bytes);
+            std::vector<float> w_row_f32(test_attn_dim);
+            const auto* traits = ggml_get_type_traits(gw0.o_proj->type);
+            float cpu_dot = 0;
+            if (traits && traits->to_float) {
+                traits->to_float(w_row_raw.data(), w_row_f32.data(), test_attn_dim);
+                for (int j = 0; j < test_attn_dim; j++) {
+                    cpu_dot += oproj_packed_ref[j] * w_row_f32[j];
+                }
+            }
+
+            fprintf(stderr, "[ggml_prefill] ISOLATED o_proj test:\n");
+            fprintf(stderr, "  test_in[0..3] = %.6f %.6f %.6f %.6f\n",
+                    oproj_packed_ref[0], oproj_packed_ref[1], oproj_packed_ref[2], oproj_packed_ref[3]);
+            fprintf(stderr, "  ggml result[0..3] = %.6f %.6f %.6f %.6f\n",
+                    test_result[0], test_result[1], test_result[2], test_result[3]);
+            fprintf(stderr, "  CPU dot = %.6f  (ratio = %.3f)\n",
+                    cpu_dot, cpu_dot != 0 ? test_result[0] / cpu_dot : 0);
+            fprintf(stderr, "  o_proj: ne=[%lld,%lld] nb=[%zu,%zu] type=%s\n",
+                    (long long)gw0.o_proj->ne[0], (long long)gw0.o_proj->ne[1],
+                    gw0.o_proj->nb[0], gw0.o_proj->nb[1],
+                    ggml_type_name(gw0.o_proj->type));
+            fprintf(stderr, "  test_in: ne=[%lld,%lld] nb=[%zu,%zu]\n",
+                    (long long)test_in->ne[0], (long long)test_in->ne[1],
+                    test_in->nb[0], test_in->nb[1]);
+            fprintf(stderr, "  test_out: ne=[%lld,%lld] nb=[%zu,%zu]\n",
+                    (long long)test_out->ne[0], (long long)test_out->ne[1],
+                    test_out->nb[0], test_out->nb[1]);
+
+            ggml_gallocr_free(test_alloc);
+            ggml_free(test_ctx);
+        }
+
+        Timer phase3_timer;
+        {
+            const int attn_dim = gw.o_proj_in;
+            const int max_tensors = 24;
+            size_t ctx_size = ggml_tensor_overhead() * max_tensors + ggml_graph_overhead();
+            ggml_init_params gp = { ctx_size, nullptr, true };
+            ggml_context* ctx = ggml_init(gp);
+
+            // Inputs
+            ggml_tensor* x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
+            ggml_set_name(x_in, "x_in");
+            ggml_set_input(x_in);
+
+            ggml_tensor* oproj_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, attn_dim, N);
+            ggml_set_name(oproj_in, "oproj_in");
+            ggml_set_input(oproj_in);
+
+            // o_proj: [attn_dim, H] x [attn_dim, N] → [H, N]
+            ggml_tensor* oproj_result = ggml_mul_mat(ctx, gw.o_proj, oproj_in);
+            ggml_set_name(oproj_result, "oproj_result");
+            ggml_set_output(oproj_result);  // preserve buffer for debug readback
+
+            // First residual: x + o_proj result
+            ggml_tensor* x_res1 = ggml_add(ctx, x_in, oproj_result);
+            ggml_set_name(x_res1, "x_res1");
+            ggml_set_output(x_res1);  // debug: preserve for readback
+
+            // Post-attention RMSNorm + scale
+            ggml_tensor* normed = ggml_rms_norm(ctx, x_res1, rms_eps_);
+            ggml_tensor* normed_scaled = ggml_mul(ctx, normed, gw.post_norm);
+            ggml_set_name(normed_scaled, "normed_scaled");
+            ggml_set_output(normed_scaled);  // debug: preserve for readback
+
+            // FFN gate + up projections
+            ggml_tensor* gate_out = ggml_mul_mat(ctx, gw.gate_proj, normed_scaled);
+            ggml_tensor* up_out = ggml_mul_mat(ctx, gw.up_proj, normed_scaled);
+
+            // SwiGLU: silu(gate) * up
+            ggml_tensor* gate_act = ggml_silu(ctx, gate_out);
+            ggml_tensor* swiglu = ggml_mul(ctx, gate_act, up_out);
+
+            // Down projection
+            ggml_tensor* down_out = ggml_mul_mat(ctx, gw.down_proj, swiglu);
+            ggml_set_name(down_out, "down_out");
+            ggml_set_output(down_out);  // debug
+
+            // Mark gate_out for debug
+            ggml_set_name(gate_out, "gate_out");
+            ggml_set_output(gate_out);
+
+            // Second residual: x_res1 + down_proj result
+            ggml_tensor* x_out = ggml_add(ctx, x_res1, down_out);
+            ggml_set_name(x_out, "x_out");
+            ggml_set_output(x_out);
+
+            // Build graph
+            ggml_cgraph* graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, x_out);
+
+            // Allocate scratch, set inputs, compute
+            ggml_gallocr_alloc_graph(gpc->allocator, graph);
+            ggml_backend_tensor_set(x_in, X.data(), 0, (size_t)N * H * sizeof(float));
+
+            // Pack Oproj from strided max_attn layout to contiguous attn_dim layout
+            {
+                std::vector<float> oproj_packed((size_t)N * attn_dim);
+                for (int i = 0; i < N; i++) {
+                    memcpy(oproj_packed.data() + (size_t)i * attn_dim,
+                           Oproj.data() + (size_t)i * max_attn,
+                           (size_t)attn_dim * sizeof(float));
+                }
+                ggml_backend_tensor_set(oproj_in, oproj_packed.data(), 0,
+                                        (size_t)N * attn_dim * sizeof(float));
+            }
+
+            ggml_backend_graph_compute(metal, graph);
+
+            // Debug: verify Phase 3 intermediates for layer 0
+            if (L == 0) {
+                // Read all preserved intermediates
+                std::vector<float> ggml_oproj((size_t)N * H);
+                ggml_backend_tensor_get(oproj_result, ggml_oproj.data(), 0, (size_t)N * H * sizeof(float));
+
+                std::vector<float> ggml_xres1((size_t)N * H);
+                ggml_backend_tensor_get(x_res1, ggml_xres1.data(), 0, (size_t)N * H * sizeof(float));
+
+                std::vector<float> ggml_normed_s((size_t)N * H);
+                ggml_backend_tensor_get(normed_scaled, ggml_normed_s.data(), 0, (size_t)N * H * sizeof(float));
+
+                // CPU reference: x_res1 = X + oproj_result
+                std::vector<float> cpu_xres1(H);
+                for (int j = 0; j < H; j++) cpu_xres1[j] = X[j] + ggml_oproj[j];
+
+                // CPU reference: normed_scaled = rms_norm(x_res1) * post_norm
+                std::vector<float> cpu_normed(H);
+                rmsnorm(cpu_normed.data(), cpu_xres1.data(), gm->cpu_layers[0].post_attention_layernorm, H, rms_eps_);
+
+                fprintf(stderr, "[ggml_prefill] L0 Phase3 debug:\n");
+                fprintf(stderr, "  oproj_result[0..3]  = %.6f %.6f %.6f %.6f\n",
+                        ggml_oproj[0], ggml_oproj[1], ggml_oproj[2], ggml_oproj[3]);
+                fprintf(stderr, "  x_res1 ggml[0..3]   = %.6f %.6f %.6f %.6f\n",
+                        ggml_xres1[0], ggml_xres1[1], ggml_xres1[2], ggml_xres1[3]);
+                fprintf(stderr, "  x_res1 cpu [0..3]   = %.6f %.6f %.6f %.6f\n",
+                        cpu_xres1[0], cpu_xres1[1], cpu_xres1[2], cpu_xres1[3]);
+                fprintf(stderr, "  normed_s ggml[0..3] = %.6f %.6f %.6f %.6f\n",
+                        ggml_normed_s[0], ggml_normed_s[1], ggml_normed_s[2], ggml_normed_s[3]);
+                fprintf(stderr, "  normed_s cpu [0..3] = %.6f %.6f %.6f %.6f\n",
+                        cpu_normed[0], cpu_normed[1], cpu_normed[2], cpu_normed[3]);
+
+                // Check max error between ggml and CPU for x_res1
+                float max_xres1_err = 0;
+                for (int j = 0; j < H; j++) {
+                    float err = fabsf(ggml_xres1[j] - cpu_xres1[j]);
+                    if (err > max_xres1_err) max_xres1_err = err;
+                }
+                float max_normed_err = 0;
+                for (int j = 0; j < H; j++) {
+                    float err = fabsf(ggml_normed_s[j] - cpu_normed[j]);
+                    if (err > max_normed_err) max_normed_err = err;
+                }
+                fprintf(stderr, "  x_res1 max_err=%.6e  normed_scaled max_err=%.6e\n",
+                        max_xres1_err, max_normed_err);
+
+                // FFN debug: read gate_out, down_out from ggml graph
+                std::vector<float> ggml_gate((size_t)N * I);
+                ggml_backend_tensor_get(gate_out, ggml_gate.data(), 0, (size_t)N * I * sizeof(float));
+                std::vector<float> ggml_down((size_t)N * H);
+                ggml_backend_tensor_get(down_out, ggml_down.data(), 0, (size_t)N * H * sizeof(float));
+
+                fprintf(stderr, "  gate_out ggml[0..3] = %.6f %.6f %.6f %.6f\n",
+                        ggml_gate[0], ggml_gate[1], ggml_gate[2], ggml_gate[3]);
+                fprintf(stderr, "  down_out ggml[0..3] = %.6f %.6f %.6f %.6f\n",
+                        ggml_down[0], ggml_down[1], ggml_down[2], ggml_down[3]);
+                fprintf(stderr, "  x_out    ggml[0..3] = %.6f %.6f %.6f %.6f\n",
+                        X[0], X[1], X[2], X[3]);
+
+                // CPU reference: gate_out[0] = dot(gate_proj row 0, normed_scaled token 0)
+                {
+                    size_t g_row_bytes = ggml_row_size(gw.gate_proj->type, H);
+                    std::vector<uint8_t> g_row_raw(g_row_bytes);
+                    ggml_backend_tensor_get(gw.gate_proj, g_row_raw.data(), 0, g_row_bytes);
+                    std::vector<float> g_row_f32(H);
+                    const auto* gtraits = ggml_get_type_traits(gw.gate_proj->type);
+                    if (gtraits && gtraits->to_float) {
+                        gtraits->to_float(g_row_raw.data(), g_row_f32.data(), H);
+                        float gate_cpu = 0;
+                        for (int j = 0; j < H; j++) gate_cpu += ggml_normed_s[j] * g_row_f32[j];
+                        fprintf(stderr, "  gate_out CPU[0] = %.6f  (ggml=%.6f diff=%.6e)\n",
+                                gate_cpu, ggml_gate[0], fabsf(gate_cpu - ggml_gate[0]));
+                    }
+                    fprintf(stderr, "  gate_proj: ne=[%lld,%lld] type=%s\n",
+                            (long long)gw.gate_proj->ne[0], (long long)gw.gate_proj->ne[1],
+                            ggml_type_name(gw.gate_proj->type));
+                }
+
+                // ============================================================
+                // Full CPU FFN reference for token 0: gate + up + silu + mul + down
+                // Dequantizes all GGUF weight rows and computes F32 reference
+                // ============================================================
+                {
+                    const auto* traits_g = ggml_get_type_traits(gw.gate_proj->type);
+                    const auto* traits_u = ggml_get_type_traits(gw.up_proj->type);
+                    const auto* traits_d = ggml_get_type_traits(gw.down_proj->type);
+
+                    if (traits_g && traits_g->to_float && traits_u && traits_u->to_float &&
+                        traits_d && traits_d->to_float) {
+                        Timer cpu_ffn_timer;
+                        const float* ns = ggml_normed_s.data(); // token 0 normed_scaled
+
+                        // gate_proj: [I] dot products with normed_scaled [H]
+                        std::vector<float> cpu_gate(I);
+                        {
+                            size_t row_bytes = ggml_row_size(gw.gate_proj->type, H);
+                            std::vector<uint8_t> all_rows((size_t)I * row_bytes);
+                            ggml_backend_tensor_get(gw.gate_proj, all_rows.data(), 0,
+                                                    (size_t)I * row_bytes);
+                            std::vector<float> row_f32(H);
+                            for (int r = 0; r < I; r++) {
+                                traits_g->to_float(all_rows.data() + (size_t)r * row_bytes,
+                                                   row_f32.data(), H);
+                                float dot = 0;
+                                for (int j = 0; j < H; j++) dot += ns[j] * row_f32[j];
+                                cpu_gate[r] = dot;
+                            }
+                        }
+
+                        // up_proj: [I] dot products with normed_scaled [H]
+                        std::vector<float> cpu_up(I);
+                        {
+                            size_t row_bytes = ggml_row_size(gw.up_proj->type, H);
+                            std::vector<uint8_t> all_rows((size_t)I * row_bytes);
+                            ggml_backend_tensor_get(gw.up_proj, all_rows.data(), 0,
+                                                    (size_t)I * row_bytes);
+                            std::vector<float> row_f32(H);
+                            for (int r = 0; r < I; r++) {
+                                traits_u->to_float(all_rows.data() + (size_t)r * row_bytes,
+                                                   row_f32.data(), H);
+                                float dot = 0;
+                                for (int j = 0; j < H; j++) dot += ns[j] * row_f32[j];
+                                cpu_up[r] = dot;
+                            }
+                        }
+
+                        // SwiGLU: silu(gate) * up
+                        std::vector<float> cpu_swiglu(I);
+                        for (int r = 0; r < I; r++) {
+                            float g = cpu_gate[r];
+                            float silu_g = g / (1.0f + expf(-g)); // silu = x * sigmoid(x)
+                            cpu_swiglu[r] = silu_g * cpu_up[r];
+                        }
+
+                        // down_proj: [H] dot products with swiglu [I]
+                        std::vector<float> cpu_down(H);
+                        {
+                            size_t row_bytes = ggml_row_size(gw.down_proj->type, I);
+                            std::vector<uint8_t> all_rows((size_t)H * row_bytes);
+                            ggml_backend_tensor_get(gw.down_proj, all_rows.data(), 0,
+                                                    (size_t)H * row_bytes);
+                            std::vector<float> row_f32(I);
+                            for (int r = 0; r < H; r++) {
+                                traits_d->to_float(all_rows.data() + (size_t)r * row_bytes,
+                                                   row_f32.data(), I);
+                                float dot = 0;
+                                for (int j = 0; j < I; j++) dot += cpu_swiglu[j] * row_f32[j];
+                                cpu_down[r] = dot;
+                            }
+                        }
+
+                        // Compare CPU vs ggml down_out
+                        float max_gate_err = 0, max_up_err = 0, max_down_err = 0;
+
+                        // Read ggml up_out for comparison
+                        // (up_out isn't marked as output in the graph, so compare gate and down)
+                        for (int r = 0; r < std::min(I, 4); r++) {
+                            float gate_err = fabsf(cpu_gate[r] - ggml_gate[r]);
+                            if (gate_err > max_gate_err) max_gate_err = gate_err;
+                        }
+                        // Full gate comparison
+                        for (int r = 0; r < I; r++) {
+                            float err = fabsf(cpu_gate[r] - ggml_gate[r]);
+                            if (err > max_gate_err) max_gate_err = err;
+                        }
+                        for (int r = 0; r < H; r++) {
+                            float err = fabsf(cpu_down[r] - ggml_down[r]);
+                            if (err > max_down_err) max_down_err = err;
+                        }
+
+                        // x_out = x_res1 + down_out
+                        std::vector<float> cpu_xout(H);
+                        for (int j = 0; j < H; j++) cpu_xout[j] = cpu_xres1[j] + cpu_down[j];
+
+                        // Read actual ggml x_out for comparison
+                        std::vector<float> ggml_xout((size_t)N * H);
+                        ggml_backend_tensor_get(x_out, ggml_xout.data(), 0, (size_t)N * H * sizeof(float));
+                        float max_xout_err = 0;
+                        for (int j = 0; j < H; j++) {
+                            float err = fabsf(cpu_xout[j] - ggml_xout[j]);
+                            if (err > max_xout_err) max_xout_err = err;
+                        }
+
+                        fprintf(stderr, "  [CPU FFN ref] gate max_err=%.6e  down max_err=%.6e  x_out max_err=%.6e (%.1f ms)\n",
+                                max_gate_err, max_down_err, max_xout_err, cpu_ffn_timer.elapsed_ms());
+                        fprintf(stderr, "  [CPU FFN ref] cpu_down[0..3] = %.6f %.6f %.6f %.6f\n",
+                                cpu_down[0], cpu_down[1], cpu_down[2], cpu_down[3]);
+                        fprintf(stderr, "  [CPU FFN ref] cpu_xout[0..3] = %.6f %.6f %.6f %.6f\n",
+                                cpu_xout[0], cpu_xout[1], cpu_xout[2], cpu_xout[3]);
+                        fprintf(stderr, "  [CPU FFN ref] ggml_xout[0..3] = %.6f %.6f %.6f %.6f\n",
+                                ggml_xout[0], ggml_xout[1], ggml_xout[2], ggml_xout[3]);
+                    }
+                }
+            }
+
+            // Read updated hidden state
+            ggml_backend_tensor_get(x_out, X.data(), 0, (size_t)N * H * sizeof(float));
+
+            ggml_free(ctx);
+        }
+        total_gpu_ms += phase3_timer.elapsed_ms();
+
+        // Per-layer X tracking
+        {
+            float xnorm = 0;
+            for (int j = 0; j < H; j++) xnorm += X[j] * X[j];
+            xnorm = sqrtf(xnorm / H);
+            fprintf(stderr, "[ggml_prefill] L%d X[0..3]=%.4f %.4f %.4f %.4f norm=%.4f\n",
+                    L, X[0], X[1], X[2], X[3], xnorm);
+        }
+    } // end layer loop
+
+    // ============================================================
+    // Final: RMSNorm + LM head projection
+    // ============================================================
+
+    {
+        const int max_tensors = 8;
+        size_t ctx_size = ggml_tensor_overhead() * max_tensors + ggml_graph_overhead();
+        ggml_init_params gp = { ctx_size, nullptr, true };
+        ggml_context* ctx = ggml_init(gp);
+
+        // Only process last token for logits
+        ggml_tensor* x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 1);
+        ggml_set_name(x_in, "x_last");
+        ggml_set_input(x_in);
+
+        ggml_tensor* normed = ggml_rms_norm(ctx, x_in, rms_eps_);
+        ggml_tensor* normed_scaled = ggml_mul(ctx, normed, gm->output_norm);
+
+        ggml_tensor* logits_out = ggml_mul_mat(ctx, gm->lm_head, normed_scaled);
+        ggml_set_name(logits_out, "logits");
+        ggml_set_output(logits_out);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, logits_out);
+
+        ggml_gallocr_alloc_graph(gpc->allocator, graph);
+
+        // Set last token's hidden state
+        float* last_hidden = X.data() + (size_t)(N - 1) * H;
+        ggml_backend_tensor_set(x_in, last_hidden, 0, (size_t)H * sizeof(float));
+
+        ggml_backend_graph_compute(metal, graph);
+
+        // Read logits [vocab_size, 1] → [vocab_size]
+        ggml_backend_tensor_get(logits_out, session.logits, 0,
+                                (size_t)vocab_size_ * sizeof(float));
+
+        ggml_free(ctx);
+    }
+
+    // Debug: check logits + CPU reference LM head
+    {
+        float max_logit = -1e30f, min_logit = 1e30f;
+        int argmax = 0;
+        for (int i = 0; i < vocab_size_; i++) {
+            if (session.logits[i] > max_logit) { max_logit = session.logits[i]; argmax = i; }
+            if (session.logits[i] < min_logit) min_logit = session.logits[i];
+        }
+        fprintf(stderr, "[ggml_prefill] logits: min=%.4f max=%.4f argmax=%d logits[0..3]=%.4f %.4f %.4f %.4f\n",
+                min_logit, max_logit, argmax,
+                session.logits[0], session.logits[1], session.logits[2], session.logits[3]);
+
+        // Also check last hidden state
+        float* last_h = X.data() + (size_t)(N - 1) * H;
+        fprintf(stderr, "[ggml_prefill] last_hidden[0..3] = %.4f %.4f %.4f %.4f\n",
+                last_h[0], last_h[1], last_h[2], last_h[3]);
+
+        // ============================================================
+        // CPU reference LM head: RMSNorm(last_hidden) × final_norm → matvec(lm_head)
+        // Uses safetensors CPU weights to verify ggml graph correctness
+        // ============================================================
+        {
+            std::vector<float> cpu_normed(H);
+            rmsnorm(cpu_normed.data(), last_h, final_norm_, H, rms_eps_);
+
+            fprintf(stderr, "[ggml_prefill] CPU final_norm[0..3] = %.6f %.6f %.6f %.6f\n",
+                    cpu_normed[0], cpu_normed[1], cpu_normed[2], cpu_normed[3]);
+
+            // Also read the ggml normed_scaled from the graph for comparison
+            // (already in session.x after rmsnorm below, but compute here for direct comparison)
+
+            // Full CPU logits via matvec with safetensors lm_head
+            std::vector<float> cpu_logits(vocab_size_);
+            matvec(cpu_logits.data(), lm_head_, cpu_normed.data(), vocab_size_, H);
+
+            float cpu_max = -1e30f, cpu_min = 1e30f;
+            int cpu_argmax = 0;
+            for (int i = 0; i < vocab_size_; i++) {
+                if (cpu_logits[i] > cpu_max) { cpu_max = cpu_logits[i]; cpu_argmax = i; }
+                if (cpu_logits[i] < cpu_min) cpu_min = cpu_logits[i];
+            }
+            fprintf(stderr, "[ggml_prefill] CPU LM head: min=%.4f max=%.4f argmax=%d logits[0..3]=%.4f %.4f %.4f %.4f\n",
+                    cpu_min, cpu_max, cpu_argmax,
+                    cpu_logits[0], cpu_logits[1], cpu_logits[2], cpu_logits[3]);
+            fprintf(stderr, "[ggml_prefill] ggml vs CPU LM head: argmax_match=%s  logit_diff[0]=%.6e  logit_diff[argmax]=%.6e\n",
+                    (argmax == cpu_argmax) ? "YES" : "NO",
+                    fabsf(session.logits[0] - cpu_logits[0]),
+                    fabsf(session.logits[argmax] - cpu_logits[argmax]));
+
+            // Compute max logit difference across all vocab
+            float max_logit_diff = 0;
+            for (int i = 0; i < vocab_size_; i++) {
+                float d = fabsf(session.logits[i] - cpu_logits[i]);
+                if (d > max_logit_diff) max_logit_diff = d;
+            }
+            fprintf(stderr, "[ggml_prefill] max logit diff (ggml vs CPU): %.6e\n", max_logit_diff);
+
+            // If argmax differs, show top-5 from each
+            if (argmax != cpu_argmax) {
+                fprintf(stderr, "[ggml_prefill] WARNING: argmax mismatch! ggml=%d cpu=%d\n", argmax, cpu_argmax);
+                // Show ggml top-5
+                std::vector<std::pair<float, int>> ggml_top(vocab_size_);
+                std::vector<std::pair<float, int>> cpu_top(vocab_size_);
+                for (int i = 0; i < vocab_size_; i++) {
+                    ggml_top[i] = {session.logits[i], i};
+                    cpu_top[i] = {cpu_logits[i], i};
+                }
+                std::partial_sort(ggml_top.begin(), ggml_top.begin() + 5, ggml_top.end(),
+                    [](auto& a, auto& b) { return a.first > b.first; });
+                std::partial_sort(cpu_top.begin(), cpu_top.begin() + 5, cpu_top.end(),
+                    [](auto& a, auto& b) { return a.first > b.first; });
+                fprintf(stderr, "  ggml top-5:");
+                for (int i = 0; i < 5; i++) fprintf(stderr, " [%d]=%.3f", ggml_top[i].second, ggml_top[i].first);
+                fprintf(stderr, "\n  cpu  top-5:");
+                for (int i = 0; i < 5; i++) fprintf(stderr, " [%d]=%.3f", cpu_top[i].second, cpu_top[i].first);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    // Also store final normed hidden state in session.x for decode continuation
+    rmsnorm(session.x, X.data() + (size_t)(N - 1) * H, final_norm_, H, rms_eps_);
+
+    double elapsed = total_timer.elapsed_ms();
+    fprintf(stderr, "[ggml_prefill] %d tokens in %.1f ms (%.1f tok/s) | gpu=%.0fms attn=%.0fms (delta=%.0f[conv=%.0f] full=%.0f)\n",
+            N, elapsed, N / (elapsed / 1000.0),
+            total_gpu_ms, total_attn_ms, delta_attn_ms, total_conv_ms, full_attn_ms);
+
+    return session.logits;
+}
+
 float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_ids, int start_pos) {
     if (token_ids.empty()) return nullptr;
+
+    // Prefer ggml-metal path when GGUF model is loaded
+    if (gguf_model_ && ggml_pfx_) {
+        return prefill_gpu_ggml(session, token_ids, start_pos);
+    }
+
     if (!gpu_weights_loaded_) {
         fprintf(stderr, "[gpu_prefill] GPU weights not loaded, falling back to ANE token-by-token\n");
         float* logits = nullptr;
@@ -2201,6 +3370,15 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
                 vDSP_vadd(X, 1, down, 1, X, 1, (vDSP_Length)(N * H));
             }
             total_ffn_ms += ffn_timer.elapsed_ms();
+        }
+
+        // Per-layer X tracking (MPS path)
+        {
+            float xnorm = 0;
+            for (int j = 0; j < H; j++) xnorm += X[j] * X[j];
+            xnorm = sqrtf(xnorm / H);
+            fprintf(stderr, "[gpu_prefill] L%d X[0..3]=%.4f %.4f %.4f %.4f norm=%.4f\n",
+                    L, X[0], X[1], X[2], X[3], xnorm);
         }
     } // end layer loop
 
