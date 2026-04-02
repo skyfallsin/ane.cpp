@@ -914,8 +914,13 @@ def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SE
     return proc, display_name, log.name
 
 
-def _start_llama_server(config_key: str, port: int, context_length: int = 32768):
-    """Start llama-server. Returns (proc, display_name) or raises."""
+def _start_llama_server(config_key: str, port: int, context_length: int = 32768,
+                        n_parallel: int = 1):
+    """Start llama-server. Returns (proc, display_name) or raises.
+    
+    context_length is PER SLOT. Total context = context_length * n_parallel.
+    llama-server's -c is total context across all -np slots.
+    """
     if not LLAMA_SERVER.exists():
         raise FileNotFoundError(f"llama-server not found: {LLAMA_SERVER}")
 
@@ -928,12 +933,30 @@ def _start_llama_server(config_key: str, port: int, context_length: int = 32768)
     if not gguf_path.exists():
         raise FileNotFoundError(f"GGUF not found: {gguf_path}")
 
+    total_context = context_length * n_parallel
+    # Thread config matching Jo production (LlamafileProcessManager.swift):
+    # -t 2 for generation, -tb up to 8 for batch/prefill, -b 512
+    physical_cores = os.cpu_count() or 8
+    reserved = 4 if physical_cores <= 16 else 6
+    available = max(1, physical_cores - reserved)
+    batch_threads = min(available, 8)
+
     server_cmd = [
         str(LLAMA_SERVER),
         "-m", str(gguf_path),
         "--port", str(port),
         "-ngl", str(ngl),
-        "-c", str(context_length),
+        "-t", "2",                              # generation threads
+        "-tb", str(batch_threads),              # batch/prefill threads
+        "-b", "512",                            # prompt batch size
+        "-np", str(n_parallel),
+        "-c", str(total_context),
+        "-fa", "on",                            # flash attention
+        "-cb",                                  # continuous batching
+        "--cache-reuse", "256",                 # KV prefix reuse threshold
+        "--slot-prompt-similarity", "0.15",     # route to matching prefix slots
+        "-ctk", "q8_0",                         # quantize KV cache keys
+        "-ctv", "q8_0",                         # quantize KV cache values
         "--temp", "0.7",
     ]
     log = tempfile.NamedTemporaryFile(delete=False, suffix=".log", mode="w")
@@ -950,8 +973,9 @@ def _fill_context(worker_id: int, port: int, target_tokens: int,
     """Send progressively longer messages to fill the KV cache to target_tokens.
     Returns the conversation history."""
     # Generate filler text.  Qwen tokenizer averages ~5 chars/token for English prose.
-    # Use diverse vocabulary, target slightly under the limit since server may truncate.
-    paragraphs = [
+    # Each worker gets a UNIQUE paragraph pool so parallel slots have different content
+    # (no artificial prefix-cache hits across slots).
+    _all_paragraphs = [
         "The history of artificial intelligence research spans decades of work across "
         "mathematics, computer science, cognitive psychology, and neuroscience. Early "
         "pioneers like Alan Turing, John McCarthy, and Marvin Minsky laid the theoretical "
@@ -979,7 +1003,35 @@ def _fill_context(worker_id: int, port: int, target_tokens: int,
         "Cryptography is the practice and study of techniques for secure communication "
         "in the presence of adversarial behavior. Modern cryptography concerns itself with "
         "confidentiality integrity authentication and non-repudiation.",
+        "The development of calculus in the 17th century by Isaac Newton and Gottfried "
+        "Wilhelm Leibniz independently was one of the most important advances in the "
+        "history of mathematics fundamentally changing our ability to model change.",
+        "Plate tectonics describes the large scale motion of seven major and many minor "
+        "plates of the Earth lithosphere since tectonic processes began on Earth between "
+        "3 and 3.5 billion years ago causing earthquakes volcanic activity and orogeny.",
+        "The human genome contains approximately 3 billion base pairs of DNA organized "
+        "into 23 pairs of chromosomes. The Human Genome Project completed in 2003 was "
+        "a landmark achievement mapping the entirety of human genetic information.",
+        "Classical music encompasses a broad range of styles from the medieval period "
+        "through the present day. Major eras include Baroque Renaissance Classical "
+        "Romantic and Modern with composers like Bach Mozart Beethoven and Stravinsky.",
+        "The Amazon rainforest covers approximately 5.5 million square kilometers and "
+        "contains roughly 10 percent of all species on Earth. Deforestation threatens "
+        "this vital ecosystem which produces about 20 percent of the world oxygen.",
+        "Neural networks loosely inspired by biological neural networks consist of "
+        "layers of interconnected nodes that process information using connectionist "
+        "approaches to computation. Deep learning uses many layers for representation.",
+        "The Silk Road was an ancient network of trade routes connecting the East and "
+        "West from the 2nd century BCE to the 18th century CE. It was central to "
+        "cultural interaction including the spread of religions arts and technologies.",
+        "Superconductivity is a phenomenon of exactly zero electrical resistance and "
+        "expulsion of magnetic flux fields occurring in certain materials cooled below "
+        "a characteristic critical temperature discovered by Heike Kamerlingh Onnes.",
     ]
+    # Rotate paragraphs by worker_id so each slot gets unique content
+    offset = worker_id * 3  # stride of 3 ensures minimal overlap
+    paragraphs = _all_paragraphs[offset:] + _all_paragraphs[:offset]
+
     # Target 5 chars/token.  Aim slightly under to avoid server rejection (llama-server
     # returns 400 if prompt exceeds context, unlike ane.cpp which truncates).
     # Leave ~200 token margin for chat template overhead + user message.
@@ -989,7 +1041,7 @@ def _fill_context(worker_id: int, port: int, target_tokens: int,
     i = 0
     while total_chars < chars_needed:
         para = paragraphs[i % len(paragraphs)]
-        section = f"Section {i+1}: {para}"
+        section = f"Worker {worker_id} Section {i+1}: {para}"
         parts.append(section)
         total_chars += len(section) + 2  # +2 for \n\n
         i += 1
@@ -1081,7 +1133,8 @@ def run_sustained(config_key: str, duration_min: float = 5.0,
     try:
         if backend == "llama":
             server_proc, display_name, log_path = _start_llama_server(config_key, port,
-                                                                      context_length=context_length)
+                                                                      context_length=context_length,
+                                                                      n_parallel=n_parallel)
         else:
             n_sessions = max(n_parallel, SUSTAINED_SESSIONS)
             server_proc, display_name, log_path = _start_ane_server(config_key, port, n_sessions=n_sessions,
