@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -81,7 +82,7 @@ LLAMA_SERVER = Path("/Users/pradeep/personal/llama.cpp/build/bin/llama-server")
 # (display_name, gguf_path relative to MODELS_DIR, gpu_layers)
 LLAMA_CONFIGS = {
     "4B-F16":    ("Qwen3.5-4B F16 (llama)", "Qwen3.5-4B/Qwen3.5-4B-F16.gguf", 99),
-    "4B-Q8_0":   ("Qwen3.5-4B Q8_0 (llama)", "Qwen3.5-4B/Qwen3.5-4B-Q8_0.gguf", 99),
+    "4B-Q8_0":   ("Qwen3.5-4B Q8_0 (llama)", "/tmp/Qwen3.5-4B-Q8_0.gguf", 99),
     "4B-Q4_K_M": ("Qwen3.5-4B Q4_K_M (llama)", "Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf", 99),
     "9B-Q4_K_M": ("Qwen3.5-9B Q4_K_M (llama)", None, 99),  # resolved at runtime
 }
@@ -848,7 +849,7 @@ def _power_windows_from_samples(samples: list, wall_start: float,
     return windows
 
 
-def _start_ane_server(config_key: str, port: int):
+def _start_ane_server(config_key: str, port: int, n_sessions: int = SUSTAINED_SESSIONS):
     """Start ane.cpp serve mode. Returns (proc, display_name) or raises."""
     display_name, model_dir, env_vars = MODEL_CONFIGS[config_key]
     model_path = MODELS_DIR / model_dir
@@ -860,7 +861,7 @@ def _start_ane_server(config_key: str, port: int):
         str(BINARY), "serve",
         "--model", str(model_path),
         "--port", str(port),
-        "--sessions", str(SUSTAINED_SESSIONS),
+        "--sessions", str(n_sessions),
         "--temp", "0.7",
     ]
     log = tempfile.NamedTemporaryFile(delete=False, suffix=".log", mode="w")
@@ -901,22 +902,63 @@ def _start_llama_server(config_key: str, port: int):
     return proc, display_name, log.name
 
 
+
+def _run_conversation_worker(worker_id: int, port: int, deadline: float,
+                             max_tokens: int, results_list: list,
+                             print_lock: threading.Lock):
+    """Worker thread: runs one conversation loop until deadline."""
+    conversation = []
+    turn_num = 0
+    prompt_offset = worker_id * 3  # stagger prompts across workers
+
+    while time.monotonic() < deadline:
+        prompt_text = TURN_PROMPTS[(turn_num + prompt_offset) % len(TURN_PROMPTS)]
+        messages = conversation[-8:] + [{"role": "user", "content": prompt_text}]
+
+        turn_num += 1
+        per_turn_timeout = min(90, max(30, int(deadline - time.monotonic())))
+        if per_turn_timeout < 5:
+            break
+
+        tr = _send_turn(port, messages, max_tokens=max_tokens, timeout=per_turn_timeout)
+        tr.turn = turn_num
+
+        q = "?"
+        with print_lock:
+            if tr.error:
+                print(f"  W{worker_id:>1}:{turn_num:>3} {q:>7} {q:>5} {tr.wall_s:>5.1f}s \u274c {tr.error}")
+            else:
+                print(f"  W{worker_id:>1}:{turn_num:>3} {tr.prompt_tokens:>5}pt {tr.completion_tokens:>4}gt "
+                      f"{tr.wall_s:>5.1f}s \u2705", flush=True)
+
+        if not tr.error:
+            conversation.append({"role": "user", "content": prompt_text})
+            if tr.prompt:
+                conversation.append({"role": "assistant", "content": tr.prompt})
+
+        results_list.append(tr)
+
+
 def run_sustained(config_key: str, duration_min: float = 5.0,
                   max_tokens: int = 200, port: int = SUSTAINED_PORT,
                   save: bool = False,
-                  backend: str = "ane") -> SustainedResult:
+                  backend: str = "ane",
+                  n_parallel: int = 1) -> SustainedResult:
     """Run a sustained multi-turn workload with continuous power monitoring.
     
     backend: "ane" for ane.cpp serve, "llama" for llama-server
+    n_parallel: number of concurrent conversation streams
     """
-    result = SustainedResult(config=f"{config_key} ({backend})", duration_min=duration_min)
+    par_label = f" \u00d7{n_parallel}" if n_parallel > 1 else ""
+    result = SustainedResult(config=f"{config_key} ({backend}{par_label})", duration_min=duration_min)
 
     # --- Start server ---
     try:
         if backend == "llama":
             server_proc, display_name, log_path = _start_llama_server(config_key, port)
         else:
-            server_proc, display_name, log_path = _start_ane_server(config_key, port)
+            n_sessions = max(n_parallel, SUSTAINED_SESSIONS)
+            server_proc, display_name, log_path = _start_ane_server(config_key, port, n_sessions=n_sessions)
     except FileNotFoundError as e:
         result.error = str(e)
         return result
@@ -945,44 +987,34 @@ def run_sustained(config_key: str, duration_min: float = 5.0,
     )
     time.sleep(0.3)
 
-    # --- Run conversation loop ---
+    # --- Run conversation loop(s) ---
     duration_s = duration_min * 60
     wall_start = time.monotonic()
     deadline = wall_start + duration_s
-    turn_num = 0
-    turn_results = []
-    conversation = []  # accumulate context
 
-    print(f"  🗣️  Running {duration_min:.1f}min sustained workload "
-          f"(max_tokens={max_tokens})...")
-    print(f"  {'Turn':>5} {'Prompt':>7} {'Gen':>5} {'Wall':>6} {'Status'}", flush=True)
+    print(f"  \U0001f3cb\ufe0f  Running {duration_min:.1f}min sustained workload "
+          f"(max_tokens={max_tokens}, {n_parallel} parallel)...")
 
-    while time.monotonic() < deadline:
-        # Pick prompt — cycle through templates, include conversation history
-        prompt_text = TURN_PROMPTS[turn_num % len(TURN_PROMPTS)]
+    turn_results = []  # thread-safe via GIL for list.append
+    print_lock = threading.Lock()
 
-        # Build messages: keep last 4 turns of context (8 messages) + new user msg
-        messages = conversation[-8:] + [{"role": "user", "content": prompt_text}]
-
-        turn_num += 1
-        per_turn_timeout = min(90, max(30, int(deadline - time.monotonic())))
-        if per_turn_timeout < 5:
-            break
-
-        tr = _send_turn(port, messages, max_tokens=max_tokens, timeout=per_turn_timeout)
-        tr.turn = turn_num
-
-        if tr.error:
-            print(f"  {turn_num:>5} {'?':>7} {'?':>5} {tr.wall_s:>5.1f}s ❌ {tr.error}")
-        else:
-            print(f"  {turn_num:>5} {tr.prompt_tokens:>5}pt {tr.completion_tokens:>4}gt "
-                  f"{tr.wall_s:>5.1f}s ✅", flush=True)
-            # Add to conversation context
-            conversation.append({"role": "user", "content": prompt_text})
-            if tr.prompt:
-                conversation.append({"role": "assistant", "content": tr.prompt})
-
-        turn_results.append(tr)
+    if n_parallel == 1:
+        # Single-threaded path
+        print(f"  {'Turn':>5} {'Prompt':>7} {'Gen':>5} {'Wall':>6} {'Status'}", flush=True)
+        _run_conversation_worker(0, port, deadline, max_tokens, turn_results, print_lock)
+    else:
+        print(f"  {'Worker':>7} {'Prompt':>7} {'Gen':>5} {'Wall':>6} {'Status'}", flush=True)
+        threads = []
+        for w in range(n_parallel):
+            t = threading.Thread(
+                target=_run_conversation_worker,
+                args=(w, port, deadline, max_tokens, turn_results, print_lock),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=duration_s + 30)
 
     wall_end = time.monotonic()
     result.wall_time_s = round(wall_end - wall_start, 3)
@@ -1237,6 +1269,8 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                         help=f"Server port for sustained mode (default: {SUSTAINED_PORT})")
     parser.add_argument("--max-gen", type=int, default=200,
                         help="Max generation tokens per turn in sustained mode (default: 200)")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="Number of parallel conversation streams (default: 1)")
     parser.add_argument("--backend", choices=["ane", "llama"], default="ane",
                         help="Server backend for sustained mode (default: ane)")
     parser.add_argument("--llama-model", metavar="CFG",
@@ -1291,6 +1325,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 ane_model, duration_min=duration,
                 max_tokens=args.max_gen, port=args.port,
                 backend="ane",
+                n_parallel=args.parallel,
             )
             print_sustained_report(r_ane, idle)
 
@@ -1310,6 +1345,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 llama_model, duration_min=duration,
                 max_tokens=args.max_gen, port=args.port + 1,
                 backend="llama",
+                n_parallel=1,  # llama.cpp baseline always single-stream
             )
             print_sustained_report(r_llama, idle)
 
@@ -1345,6 +1381,7 @@ Model configs: 4B-INT8, 4B-FP16, 9B-INT8, 9B-FP16
                 model, duration_min=duration,
                 max_tokens=args.max_gen, port=args.port,
                 backend=backend,
+                n_parallel=args.parallel,
             )
             print_sustained_report(r, idle)
             if args.save:
